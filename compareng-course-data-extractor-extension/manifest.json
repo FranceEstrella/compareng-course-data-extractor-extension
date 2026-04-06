@@ -1,0 +1,35 @@
+{
+    "manifest_version": 3,
+    "name": "ComParEng Courses Data Extractor",
+    "version": "1.0.1",
+    "description": "Extracts course data from the student portal to the ComParEng's tools.",
+
+    "host_permissions": [
+      "http://localhost:3000/*",
+      "https://compareng-tools.vercel.app/*",
+      "https://compareng-coursetracker.vercel.app/*"
+    ],
+
+    "content_scripts": [
+      {
+        "matches": ["https://solar.feutech.edu.ph/course/offerings"],
+        "js": ["content.js"]
+      }
+    ],
+    "background": {
+      "service_worker": "background.js"
+    },
+    "action": {
+      "default_popup": "popup.html",
+      "default_icon": {
+        "16": "images/icon16.png",
+        "48": "images/icon48.png",
+        "128": "images/icon128.png"
+      }
+    },
+    "icons": {
+      "16": "images/icon16.png",
+      "48": "images/icon48.png",
+      "128": "images/icon128.png"
+    }
+  }
