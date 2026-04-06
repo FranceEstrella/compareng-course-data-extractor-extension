@@ -31,6 +31,11 @@ chrome.runtime.onMessage.addListener(function(request, sender, sendResponse) {
         ];
 
         const localTarget = targets[0];
+        const fetchedContext = {
+            term: String(courseData[0]?.term || "").trim(),
+            schoolYear: String(courseData[0]?.schoolYear || "").trim(),
+            updatedAt: Date.now()
+        };
 
         Promise.allSettled(targets.map(url => {
             return fetch(url, {
@@ -72,12 +77,14 @@ chrome.runtime.onMessage.addListener(function(request, sender, sendResponse) {
 
             const localResult = normalized.find(item => item.url === localTarget);
             if (localResult?.ok) {
+                chrome.storage.local.set({ lastFetchedCourseContext: fetchedContext });
                 sendResponse({ success: true, message: "Data sent to local API successfully.", targets: normalized });
                 return;
             }
 
             const firstSuccess = normalized.find(item => item.ok);
             if (firstSuccess) {
+                chrome.storage.local.set({ lastFetchedCourseContext: fetchedContext });
                 sendResponse({ success: true, message: `Data sent successfully to ${firstSuccess.url}.`, targets: normalized });
                 return;
             }

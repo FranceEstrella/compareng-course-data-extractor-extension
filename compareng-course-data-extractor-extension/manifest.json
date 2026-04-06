@@ -10,6 +10,10 @@
       "https://compareng-coursetracker.vercel.app/*"
     ],
 
+    "permissions": [
+      "storage"
+    ],
+
     "content_scripts": [
       {
         "matches": ["https://solar.feutech.edu.ph/course/offerings"],
