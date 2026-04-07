@@ -7,21 +7,41 @@
     "host_permissions": [
       "http://localhost:3000/*",
       "https://compareng-tools.vercel.app/*",
-      "https://compareng-coursetracker.vercel.app/*"
+      "https://compareng-coursetracker.vercel.app/*",
+      "https://solar.feutech.edu.ph/*",
+      "https://*.feutech.edu.ph/*"
     ],
 
     "permissions": [
-      "storage"
+      "storage",
+      "tabs"
     ],
 
     "content_scripts": [
       {
-        "matches": ["https://solar.feutech.edu.ph/course/offerings"],
-        "js": ["content.js"]
+        "matches": [
+          "https://solar.feutech.edu.ph/*",
+          "https://*.feutech.edu.ph/*"
+        ],
+        "js": [
+          "oses-success-verifier.js",
+          "oses-auth-state.js",
+          "oses-iframe-monitor.js",
+          "content.js"
+        ],
+        "all_frames": true,
+        "run_at": "document_idle"
       }
     ],
     "background": {
       "service_worker": "background.js"
+    },
+    "externally_connectable": {
+      "matches": [
+        "https://compareng-tools.vercel.app/*",
+        "http://localhost:3000/*",
+        "https://compareng-coursetracker.vercel.app/*"
+      ]
     },
     "action": {
       "default_popup": "popup.html",

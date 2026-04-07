@@ -112,6 +112,84 @@ h1 {
   color: rgba(219, 234, 254, 0.8);
 }
 
+#oses-status-wrap {
+  width: 100%;
+  border: 1px solid rgba(191, 219, 254, 0.35);
+  background: rgba(2, 6, 23, 0.2);
+  border-radius: 8px;
+  padding: 10px;
+  box-sizing: border-box;
+  margin-bottom: 14px;
+  text-align: left;
+}
+
+.oses-title {
+  font-size: 12px;
+  color: #dbeafe;
+  margin-bottom: 6px;
+  font-weight: 600;
+}
+
+#oses-status-text {
+  font-size: 12px;
+  color: #e0f2fe;
+  min-height: 30px;
+  line-height: 1.4;
+}
+
+#oses-info-wrap {
+  width: 100%;
+  border: 1px solid rgba(191, 219, 254, 0.35);
+  background: rgba(2, 6, 23, 0.2);
+  border-radius: 8px;
+  padding: 10px;
+  box-sizing: border-box;
+  margin-bottom: 14px;
+  text-align: left;
+}
+
+.oses-info-grid {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 6px;
+}
+
+.oses-info-item {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 12px;
+}
+
+.oses-info-label {
+  color: #dbeafe;
+  opacity: 0.9;
+}
+
+.oses-info-value {
+  color: #e0f2fe;
+  font-weight: 600;
+  text-align: right;
+  word-break: break-word;
+}
+
+#oses-retry {
+  margin-top: 8px;
+  width: 100%;
+  border: 1px solid rgba(255, 255, 255, 0.35);
+  background: rgba(255, 255, 255, 0.18);
+  color: #fff;
+  border-radius: 6px;
+  padding: 8px;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+#oses-retry[disabled] {
+  opacity: 0.65;
+  cursor: not-allowed;
+}
+
 .loader {
   border: 4px solid rgba(255, 255, 255, 0.3);
   border-top: 4px solid #4CAF50;
@@ -173,6 +251,24 @@ h1 {
     <div class="loader" id="loader"></div>
     <p id="status">Running in the background...</p>
     <p id="fetched-status"></p>
+    <div id="oses-status-wrap">
+      <div class="oses-title">OSES Auto-Login (Milestone 1)</div>
+      <div id="oses-status-text">No OSES status yet.</div>
+      <button id="oses-retry" type="button">Retry OSES Check</button>
+    </div>
+    <div id="oses-info-wrap">
+      <div class="oses-title">OSES Info</div>
+      <div class="oses-info-grid">
+        <div class="oses-info-item">
+          <span class="oses-info-label">Student #</span>
+          <span class="oses-info-value" id="oses-student-number">Not detected</span>
+        </div>
+        <div class="oses-info-item">
+          <span class="oses-info-label">Forwarded Section</span>
+          <span class="oses-info-value" id="oses-forwarded-section">None</span>
+        </div>
+      </div>
+    </div>
     <div id="button-container">
       <a id="launch-tools" href="https://compareng-tools.vercel.app/" class="button" target="_blank">
         <img src="images/default_icon.png" alt="Tools" class="button-icon" />

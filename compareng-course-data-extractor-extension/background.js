@@ -1,6 +1,84 @@
-console.log("Background script loaded! [build 1.0.1-term-year-fix]");
+console.log("Background script loaded! [build 1.1.0-oses-login-m1]");
+
+function normalizeBlockEnrollmentRequest(raw) {
+    const source = raw || {};
+    const studentTypeRaw = String(source.studentType || source.tag || "").trim().toLowerCase();
+    const isRegular = source.isRegular === true || studentTypeRaw === "regular";
+    const blockSection = String(source.blockSection || source.block || "").trim().toUpperCase();
+
+    return {
+        isRegular,
+        studentType: isRegular ? "regular" : (studentTypeRaw || "unknown"),
+        blockSection,
+        updatedAt: Date.now()
+    };
+}
+
+function persistBlockEnrollmentRequest(raw) {
+    const normalized = normalizeBlockEnrollmentRequest(raw);
+
+    if (!normalized.isRegular) {
+        throw new Error("Student is not tagged as regular. Block automation skipped.");
+    }
+
+    if (!normalized.blockSection) {
+        throw new Error("Missing block section from app payload.");
+    }
+
+    chrome.storage.local.set({ osesBlockEnrollmentRequest: normalized });
+    return normalized;
+}
+
+async function runOSESRetryOnActiveTab() {
+    const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
+    const activeTab = tabs && tabs[0];
+
+    if (!activeTab || typeof activeTab.id !== "number") {
+        throw new Error("No active browser tab available.");
+    }
+
+    const url = activeTab.url || "";
+    if (!url.includes("solar.feutech.edu.ph/course/registration")) {
+        throw new Error("Open the Course Registration page before retrying.");
+    }
+
+    await chrome.tabs.sendMessage(activeTab.id, { action: "startOSESAutomation" });
+}
 
 chrome.runtime.onMessage.addListener(function(request, sender, sendResponse) {
+    if (request.action === "osesAutomationStatus") {
+        const statusPayload = {
+            ...(request.data || {}),
+            updatedAt: Date.now()
+        };
+
+        chrome.storage.local.set({ osesAutomationStatus: statusPayload });
+        sendResponse({ success: true });
+        return false;
+    }
+
+    if (request.action === "retryOSESAutomation") {
+        runOSESRetryOnActiveTab()
+            .then(() => {
+                sendResponse({ success: true });
+            })
+            .catch((error) => {
+                sendResponse({ success: false, message: error?.message || String(error) });
+            });
+
+        return true;
+    }
+
+    if (request.action === "setOSESBlockEnrollmentRequest") {
+        try {
+            const saved = persistBlockEnrollmentRequest(request.data);
+            sendResponse({ success: true, data: saved });
+        } catch (error) {
+            sendResponse({ success: false, message: error?.message || String(error) });
+        }
+        return false;
+    }
+
     if (request.action === "courseDataExtracted") {
         const courseData = request.data; // Correctly access the data from request.data
         console.log("Received course data in background script:", courseData);
@@ -99,5 +177,26 @@ chrome.runtime.onMessage.addListener(function(request, sender, sendResponse) {
 
         return true; // Indicate asynchronous response
     }
+    return false;
+});
+
+chrome.runtime.onMessageExternal.addListener((request, sender, sendResponse) => {
+    if (request?.action !== "setOSESBlockEnrollmentRequest") return false;
+
+    const senderUrl = String(sender?.url || "");
+    const trustedSender = senderUrl.startsWith("https://compareng-tools.vercel.app/") || senderUrl.startsWith("http://localhost:3000/") || senderUrl.startsWith("https://compareng-coursetracker.vercel.app/");
+
+    if (!trustedSender) {
+        sendResponse({ success: false, message: "Untrusted sender for block enrollment request." });
+        return false;
+    }
+
+    try {
+        const saved = persistBlockEnrollmentRequest(request.data);
+        sendResponse({ success: true, data: saved });
+    } catch (error) {
+        sendResponse({ success: false, message: error?.message || String(error) });
+    }
+
     return false;
 });
