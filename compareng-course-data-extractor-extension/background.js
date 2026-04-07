@@ -1,5 +1,180 @@
 console.log("Background script loaded! [build 1.1.0-oses-login-m1]");
 
+self.addEventListener("unhandledrejection", (event) => {
+    const reasonText = String(event?.reason?.message || event?.reason || "");
+    if (/no\s*sw/i.test(reasonText)) {
+        event.preventDefault();
+        console.warn("Ignored transient service worker rejection:", reasonText);
+    }
+});
+
+function queryTabsSafe(queryInfo) {
+    return new Promise((resolve, reject) => {
+        try {
+            chrome.tabs.query(queryInfo, (tabs) => {
+                const runtimeError = chrome.runtime.lastError;
+                if (runtimeError) {
+                    reject(new Error(runtimeError.message || "Failed to query tabs."));
+                    return;
+                }
+
+                resolve(Array.isArray(tabs) ? tabs : []);
+            });
+        } catch (error) {
+            reject(error instanceof Error ? error : new Error(String(error)));
+        }
+    });
+}
+
+function sendTabMessageSafe(tabId, payload) {
+    return new Promise((resolve, reject) => {
+        try {
+            chrome.tabs.sendMessage(tabId, payload, (response) => {
+                const runtimeError = chrome.runtime.lastError;
+                if (runtimeError) {
+                    reject(new Error(runtimeError.message || "Failed to send tab message."));
+                    return;
+                }
+
+                resolve(response);
+            });
+        } catch (error) {
+            reject(error instanceof Error ? error : new Error(String(error)));
+        }
+    });
+}
+
+function ensureDeveloperDefaults() {
+    chrome.storage.local.get([
+        "osesDeveloperMode",
+        "osesRegularAutoAddPaused",
+        "osesIrregularAutoAddPaused"
+    ], (result) => {
+        const patch = {};
+        if (typeof result?.osesDeveloperMode !== "boolean") patch.osesDeveloperMode = true;
+        if (typeof result?.osesRegularAutoAddPaused !== "boolean") patch.osesRegularAutoAddPaused = false;
+        if (typeof result?.osesIrregularAutoAddPaused !== "boolean") patch.osesIrregularAutoAddPaused = false;
+        if (Object.keys(patch).length > 0) {
+            chrome.storage.local.set(patch);
+        }
+    });
+}
+
+ensureDeveloperDefaults();
+
+function ensureAutomationModeConsistency() {
+    chrome.storage.local.get([
+        "osesBlockEnrollmentRequest",
+        "osesIrregularEnrollmentRequest",
+        "osesIrregularProgress"
+    ], (result) => {
+        const regular = result?.osesBlockEnrollmentRequest;
+        const irregular = result?.osesIrregularEnrollmentRequest;
+        const irregularProgress = result?.osesIrregularProgress;
+
+        const regularActive = Boolean(regular?.isRegular === true && String(regular?.blockSection || "").trim());
+        const irregularActive = Boolean(
+            irregular?.isIrregular === true &&
+            Array.isArray(irregular?.queue) &&
+            irregular.queue.length > 0 &&
+            irregularProgress?.status !== "completed"
+        );
+
+        if (regularActive && irregularActive) {
+            // Irregular mode takes precedence when both are present.
+            chrome.storage.local.set({ osesBlockEnrollmentRequest: null });
+        }
+    });
+}
+
+ensureAutomationModeConsistency();
+
+function createRunId(prefix) {
+    return `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+}
+
+function normalizeIrregularEnrollmentRequest(raw) {
+    const source = raw || {};
+    const studentTypeRaw = String(source.studentType || source.tag || "").trim().toLowerCase();
+    const isIrregular = source.isIrregular === true || studentTypeRaw === "irregular";
+    const queueRaw = Array.isArray(source.courses) ? source.courses : [];
+
+    const queue = queueRaw
+        .map((item, index) => {
+            const courseCode = String(item?.courseCode || item?.code || "").trim().toUpperCase();
+            const section = String(item?.section || item?.classSection || "").trim().toUpperCase();
+            if (!courseCode || !section) return null;
+
+            return {
+                id: `${courseCode}__${section}__${index}`,
+                courseCode,
+                section,
+                order: index,
+                status: "pending",
+                attempts: 0,
+                lastError: ""
+            };
+        })
+        .filter(Boolean);
+
+    return {
+        isIrregular,
+        studentType: isIrregular ? "irregular" : (studentTypeRaw || "unknown"),
+        queue,
+        retryMode: source.retryMode === "retry_until_all" ? "retry_until_all" : "retry_once",
+        requestedAt: Date.now(),
+        runId: createRunId("irreg")
+    };
+}
+
+function buildIrregularProgress(request) {
+    return {
+        runId: request.runId,
+        status: "queued",
+        total: request.queue.length,
+        currentIndex: 0,
+        added: [],
+        missing: [],
+        updatedAt: Date.now(),
+        prompt: {
+            showRetryChoice: false,
+            defaultChoice: "retry_once"
+        }
+    };
+}
+
+function persistIrregularEnrollmentRequest(raw) {
+    const normalized = normalizeIrregularEnrollmentRequest(raw);
+
+    if (!normalized.isIrregular) {
+        throw new Error("Student is not tagged as irregular. Irregular automation skipped.");
+    }
+
+    if (!normalized.queue.length) {
+        throw new Error("Missing irregular course queue from app payload.");
+    }
+
+    const progress = buildIrregularProgress(normalized);
+
+    chrome.storage.local.set({
+        osesBlockEnrollmentRequest: null,
+        osesIrregularEnrollmentRequest: normalized,
+        osesIrregularProgress: progress,
+        osesIrregularRetryMode: normalized.retryMode
+    });
+
+    return {
+        request: normalized,
+        progress
+    };
+}
+
+function setIrregularRetryMode(mode) {
+    const normalizedMode = mode === "retry_until_all" ? "retry_until_all" : "retry_once";
+    chrome.storage.local.set({ osesIrregularRetryMode: normalizedMode });
+    return normalizedMode;
+}
+
 function normalizeBlockEnrollmentRequest(raw) {
     const source = raw || {};
     const studentTypeRaw = String(source.studentType || source.tag || "").trim().toLowerCase();
@@ -25,12 +200,17 @@ function persistBlockEnrollmentRequest(raw) {
         throw new Error("Missing block section from app payload.");
     }
 
-    chrome.storage.local.set({ osesBlockEnrollmentRequest: normalized });
+    chrome.storage.local.set({
+        osesBlockEnrollmentRequest: normalized,
+        osesIrregularEnrollmentRequest: null,
+        osesIrregularProgress: null,
+        osesIrregularRetryMode: null
+    });
     return normalized;
 }
 
 async function runOSESRetryOnActiveTab() {
-    const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
+    const tabs = await queryTabsSafe({ active: true, currentWindow: true });
     const activeTab = tabs && tabs[0];
 
     if (!activeTab || typeof activeTab.id !== "number") {
@@ -42,17 +222,120 @@ async function runOSESRetryOnActiveTab() {
         throw new Error("Open the Course Registration page before retrying.");
     }
 
-    await chrome.tabs.sendMessage(activeTab.id, { action: "startOSESAutomation" });
+    await sendTabMessageSafe(activeTab.id, { action: "startOSESAutomation" });
+}
+
+async function triggerIrregularEnrollmentOnRegistrationTab() {
+    const tabs = await queryTabsSafe({ url: "https://solar.feutech.edu.ph/course/registration*" });
+    const target = tabs.find((tab) => typeof tab.id === "number" && tab.active) || tabs.find((tab) => typeof tab.id === "number");
+
+    if (!target || typeof target.id !== "number") {
+        throw new Error("Open Course Registration page to run irregular auto-add.");
+    }
+
+    await sendTabMessageSafe(target.id, { action: "startIrregularEnrollment" });
+}
+
+async function triggerRegularEnrollmentOnRegistrationTab() {
+    const tabs = await queryTabsSafe({ url: "https://solar.feutech.edu.ph/course/registration*" });
+    const target = tabs.find((tab) => typeof tab.id === "number" && tab.active) || tabs.find((tab) => typeof tab.id === "number");
+
+    if (!target || typeof target.id !== "number") {
+        throw new Error("Open Course Registration page to run regular auto-add.");
+    }
+
+    await sendTabMessageSafe(target.id, { action: "startRegularBlockEnrollment" });
+}
+
+function setAutomationControl(target, paused) {
+    const isPaused = paused === true;
+
+    if (target === "regular") {
+        chrome.storage.local.set({ osesRegularAutoAddPaused: isPaused });
+        return { target, paused: isPaused };
+    }
+
+    if (target === "irregular") {
+        chrome.storage.local.set({ osesIrregularAutoAddPaused: isPaused });
+        return { target, paused: isPaused };
+    }
+
+    throw new Error("Unknown automation target.");
+}
+
+function isTrustedExternalSenderUrl(rawUrl) {
+    const senderUrl = String(rawUrl || "").trim();
+    if (!senderUrl) return false;
+
+    try {
+        const parsed = new URL(senderUrl);
+        const host = parsed.hostname.toLowerCase();
+        const protocol = parsed.protocol.toLowerCase();
+
+        if ((host === "localhost" || host === "127.0.0.1") && (protocol === "http:" || protocol === "https:")) {
+            return true;
+        }
+
+        if (protocol === "https:" && (host === "compareng-tools.vercel.app" || host === "compareng-coursetracker.vercel.app" || host.endsWith(".vercel.app"))) {
+            return true;
+        }
+    } catch {
+        return false;
+    }
+
+    return false;
+}
+
+function mergeAutomationStatus(previousStatus, incomingStatus) {
+    const prev = previousStatus || {};
+    const incoming = incomingStatus || {};
+
+    const merged = {
+        ...prev,
+        ...incoming,
+        updatedAt: Date.now()
+    };
+
+    const incomingStudent = String(incoming?.studentNumber || "").trim();
+    const previousStudent = String(prev?.studentNumber || "").trim();
+
+    if (incomingStudent) {
+        merged.studentNumber = incomingStudent;
+    } else if (previousStudent) {
+        merged.studentNumber = previousStudent;
+    }
+
+    return merged;
+}
+
+function storeAutomationStatus(statusUpdate, callback) {
+    chrome.storage.local.get(["osesAutomationStatus"], (result) => {
+        const previous = result?.osesAutomationStatus || {};
+        const next = mergeAutomationStatus(previous, statusUpdate);
+        chrome.storage.local.set({ osesAutomationStatus: next }, () => {
+            if (typeof callback === "function") callback(next);
+        });
+    });
 }
 
 chrome.runtime.onMessage.addListener(function(request, sender, sendResponse) {
     if (request.action === "osesAutomationStatus") {
-        const statusPayload = {
-            ...(request.data || {}),
-            updatedAt: Date.now()
-        };
+        const statusPayload = request.data || {};
+        storeAutomationStatus(statusPayload);
 
-        chrome.storage.local.set({ osesAutomationStatus: statusPayload });
+        if (statusPayload.stage === "logged_in_verified") {
+            chrome.storage.local.get(["osesIrregularEnrollmentRequest", "osesIrregularProgress"], (result) => {
+                const irregRequest = result?.osesIrregularEnrollmentRequest;
+                const irregProgress = result?.osesIrregularProgress;
+                if (!irregRequest?.isIrregular) return;
+                if (irregProgress?.status === "completed") return;
+
+                triggerIrregularEnrollmentOnRegistrationTab().catch(() => {
+                    // Keep status-only behavior safe when tab is not ready.
+                });
+            });
+        }
+
         sendResponse({ success: true });
         return false;
     }
@@ -77,6 +360,65 @@ chrome.runtime.onMessage.addListener(function(request, sender, sendResponse) {
             sendResponse({ success: false, message: error?.message || String(error) });
         }
         return false;
+    }
+
+    if (request.action === "setOSESIrregularEnrollmentRequest") {
+        try {
+            const saved = persistIrregularEnrollmentRequest(request.data);
+            storeAutomationStatus({
+                stage: "irregular_queue_received",
+                message: `Received irregular queue with ${saved?.request?.queue?.length || 0} course section(s).`,
+                source: "background"
+            });
+            sendResponse({ success: true, data: saved });
+        } catch (error) {
+            sendResponse({ success: false, message: error?.message || String(error) });
+        }
+        return false;
+    }
+
+    if (request.action === "setOSESIrregularRetryMode") {
+        try {
+            const mode = setIrregularRetryMode(request?.data?.mode);
+            sendResponse({ success: true, data: { mode } });
+        } catch (error) {
+            sendResponse({ success: false, message: error?.message || String(error) });
+        }
+        return false;
+    }
+
+    if (request.action === "setAutomationControl") {
+        try {
+            const target = String(request?.data?.target || "").trim().toLowerCase();
+            const paused = request?.data?.paused === true;
+            const state = setAutomationControl(target, paused);
+
+            if (!paused && target === "regular") {
+                triggerRegularEnrollmentOnRegistrationTab()
+                    .then(() => sendResponse({ success: true, data: state }))
+                    .catch((error) => sendResponse({ success: false, message: error?.message || String(error) }));
+                return true;
+            }
+
+            if (!paused && target === "irregular") {
+                triggerIrregularEnrollmentOnRegistrationTab()
+                    .then(() => sendResponse({ success: true, data: state }))
+                    .catch((error) => sendResponse({ success: false, message: error?.message || String(error) }));
+                return true;
+            }
+
+            sendResponse({ success: true, data: state });
+        } catch (error) {
+            sendResponse({ success: false, message: error?.message || String(error) });
+        }
+        return false;
+    }
+
+    if (request.action === "retryOSESIrregularEnrollment") {
+        triggerIrregularEnrollmentOnRegistrationTab()
+            .then(() => sendResponse({ success: true }))
+            .catch((error) => sendResponse({ success: false, message: error?.message || String(error) }));
+        return true;
     }
 
     if (request.action === "courseDataExtracted") {
@@ -181,17 +523,29 @@ chrome.runtime.onMessage.addListener(function(request, sender, sendResponse) {
 });
 
 chrome.runtime.onMessageExternal.addListener((request, sender, sendResponse) => {
-    if (request?.action !== "setOSESBlockEnrollmentRequest") return false;
+    const externalAction = request?.action;
+    if (externalAction !== "setOSESBlockEnrollmentRequest" && externalAction !== "setOSESIrregularEnrollmentRequest") return false;
 
     const senderUrl = String(sender?.url || "");
-    const trustedSender = senderUrl.startsWith("https://compareng-tools.vercel.app/") || senderUrl.startsWith("http://localhost:3000/") || senderUrl.startsWith("https://compareng-coursetracker.vercel.app/");
+    const trustedSender = isTrustedExternalSenderUrl(senderUrl);
 
     if (!trustedSender) {
-        sendResponse({ success: false, message: "Untrusted sender for block enrollment request." });
+        sendResponse({ success: false, message: `Untrusted sender for enrollment request: ${senderUrl || "unknown"}` });
         return false;
     }
 
     try {
+        if (externalAction === "setOSESIrregularEnrollmentRequest") {
+            const saved = persistIrregularEnrollmentRequest(request.data);
+            storeAutomationStatus({
+                stage: "irregular_queue_received",
+                message: `Received irregular queue with ${saved?.request?.queue?.length || 0} course section(s).`,
+                source: "external"
+            });
+            sendResponse({ success: true, data: saved });
+            return false;
+        }
+
         const saved = persistBlockEnrollmentRequest(request.data);
         sendResponse({ success: true, data: saved });
     } catch (error) {

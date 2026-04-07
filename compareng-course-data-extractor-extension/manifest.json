@@ -1,7 +1,7 @@
 {
     "manifest_version": 3,
     "name": "ComParEng Courses Data Extractor",
-    "version": "1.0.1",
+    "version": "1.1.0",
     "description": "Extracts course data from the student portal to the ComParEng's tools.",
 
     "host_permissions": [
@@ -39,8 +39,10 @@
     "externally_connectable": {
       "matches": [
         "https://compareng-tools.vercel.app/*",
-        "http://localhost:3000/*",
-        "https://compareng-coursetracker.vercel.app/*"
+        "https://compareng-coursetracker.vercel.app/*",
+        "https://*.vercel.app/*",
+        "http://localhost/*",
+        "http://127.0.0.1/*"
       ]
     },
     "action": {

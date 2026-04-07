@@ -20,6 +20,16 @@ const confirmationAutomationState = {
   lastRequestedBlock: ""
 };
 
+const irregularAutomationState = {
+  inFlight: false,
+  runningRunId: "",
+  stopRequested: false
+};
+
+const regularAutomationState = {
+  pauseNotified: false
+};
+
 const loginAutomationState = {
   inFlight: false,
   lastClickedAt: 0
@@ -37,7 +47,14 @@ function safeSendRuntimeMessage(payload, callback) {
   if (!hasUsableExtensionContext()) return false;
   try {
     if (typeof callback === "function") {
-      chrome.runtime.sendMessage(payload, callback);
+      chrome.runtime.sendMessage(payload, (response) => {
+        const runtimeError = chrome.runtime.lastError;
+        if (runtimeError) {
+          callback({ success: false, message: runtimeError.message, runtimeError: true });
+          return;
+        }
+        callback(response);
+      });
     } else {
       chrome.runtime.sendMessage(payload);
     }
@@ -95,6 +112,16 @@ function postOSESStatus(stage, message, details = {}) {
       ...details
     }
   });
+}
+
+async function isRegularAutomationPaused() {
+  const store = await readStorage(["osesRegularAutoAddPaused"]);
+  return store?.osesRegularAutoAddPaused === true;
+}
+
+async function isIrregularAutomationPaused() {
+  const store = await readStorage(["osesIrregularAutoAddPaused"]);
+  return store?.osesIrregularAutoAddPaused === true;
 }
 
 async function runOSESAutomation() {
@@ -164,7 +191,7 @@ function postFrameStatusIfRelevant() {
   const enrollmentUiReady = Boolean(document.querySelector("#block_enrolled, iframe#frm-block, #course_enrolled"));
 
   if (state.state === "authenticated") {
-    postOSESStatus("logged_in_verified", "OSES session verified via student number in topright.", {
+    postOSESStatus("logged_in_verified", "Logged in verified.", {
       reason: state.reason,
       studentNumber: state.studentNumber || "",
       source: "iframe"
@@ -488,9 +515,38 @@ async function runRegularBlockEnrollment() {
   if (!isInsideOSESMainEnrollmentPage()) return;
   if (blockAutomationState.inFlight) return;
 
+  if (await isRegularAutomationPaused()) {
+    if (!regularAutomationState.pauseNotified) {
+      postOSESStatus("regular_paused", "Regular auto-add is paused. Press Start in popup to continue.", {
+        source: "block-automation"
+      });
+      regularAutomationState.pauseNotified = true;
+    }
+    return;
+  }
+
+  regularAutomationState.pauseNotified = false;
+
   blockAutomationState.inFlight = true;
   try {
-    const store = await readStorage(["osesBlockEnrollmentRequest"]);
+    const store = await readStorage(["osesBlockEnrollmentRequest", "osesIrregularEnrollmentRequest", "osesIrregularProgress"]);
+    const irregularRequest = store.osesIrregularEnrollmentRequest;
+    const irregularProgress = store.osesIrregularProgress;
+    const irregularActive = Boolean(
+      irregularRequest?.isIrregular &&
+      Array.isArray(irregularRequest?.queue) &&
+      irregularRequest.queue.length > 0 &&
+      irregularProgress?.status !== "completed"
+    );
+
+    if (irregularActive) {
+      postOSESStatus("waiting_oses", "Irregular queue is active. Regular block automation is skipped.", {
+        reason: "irregular-mode-active",
+        source: "block-automation"
+      });
+      return;
+    }
+
     const request = store.osesBlockEnrollmentRequest;
     if (!request || request.isRegular !== true) return;
 
@@ -609,6 +665,589 @@ async function runRegularBlockEnrollment() {
   }
 }
 
+function normalizeKey(value) {
+  return String(value || "").trim().toUpperCase().replace(/[^A-Z0-9]/g, "");
+}
+
+function removeExtMaskIfPresent() {
+  const masks = Array.from(document.querySelectorAll(".ext-el-mask"));
+  if (!masks.length) return false;
+
+  masks.forEach((mask) => {
+    try {
+      mask.remove();
+    } catch {
+      mask.style.display = "none";
+      mask.style.pointerEvents = "none";
+      mask.style.opacity = "0";
+    }
+  });
+  return true;
+}
+
+function findGridGroupByCourseCode(courseCode) {
+  const desired = normalizeKey(courseCode);
+  if (!desired) return null;
+
+  const groups = Array.from(document.querySelectorAll(".x-grid-group-title"));
+  return groups.find((group) => normalizeKey(group.textContent).includes(desired)) || null;
+}
+
+function expandGroup(groupTitle) {
+  if (!groupTitle) return false;
+
+  const groupRoot = groupTitle.closest(".x-grid-group") || groupTitle.parentElement;
+  const collapsed = groupRoot?.classList?.contains("x-grid-group-collapsed") || groupTitle.getAttribute("aria-expanded") === "false";
+  if (collapsed) {
+    clickElementBestEffort(groupTitle);
+    return true;
+  }
+
+  return false;
+}
+
+function getGroupRoot(groupTitle) {
+  if (!groupTitle) return null;
+  return groupTitle.closest(".x-grid-group") || groupTitle.parentElement || null;
+}
+
+function listSectionsInGroup(groupRoot) {
+  if (!groupRoot || !groupRoot.querySelectorAll) return [];
+  return Array.from(groupRoot.querySelectorAll(".x-grid3-cell-inner.x-grid3-col-2"))
+    .map((cell) => String(cell.textContent || "").trim().toUpperCase())
+    .filter(Boolean);
+}
+
+function findSectionCellInGroup(groupRoot, section) {
+  const desired = normalizeKey(section);
+  if (!desired) return null;
+
+  const searchRoot = groupRoot && groupRoot.querySelectorAll ? groupRoot : document;
+  const candidates = Array.from(searchRoot.querySelectorAll(".x-grid3-cell-inner.x-grid3-col-2"));
+
+  const exact = candidates.find((cell) => normalizeKey(cell.textContent) === desired);
+  if (exact) return exact;
+
+  return candidates.find((cell) => normalizeKey(cell.textContent).includes(desired)) || null;
+}
+
+function selectSectionRowCheckbox(sectionCell) {
+  if (!sectionCell) return false;
+
+  const row = sectionCell.closest(".x-grid3-row") || sectionCell.closest("tr") || sectionCell.parentElement;
+  if (!row) return false;
+
+  const checkbox = row.querySelector("input[type='checkbox']");
+  if (checkbox) {
+    if (!checkbox.checked) clickElementBestEffort(checkbox);
+    return true;
+  }
+
+  const checker = row.querySelector(".x-grid3-row-checker, .x-grid3-check-col, .x-grid3-cell-first");
+  if (checker) {
+    clickElementBestEffort(checker);
+    if (row.classList.contains("x-grid3-row-selected") || row.getAttribute("aria-selected") === "true") return true;
+  }
+
+  // ExtJS fallback: selecting the row itself can toggle check model in some grids.
+  clickElementBestEffort(row);
+  const selectedAfterRowClick = row.classList.contains("x-grid3-row-selected") || row.getAttribute("aria-selected") === "true";
+  if (selectedAfterRowClick) return true;
+
+  return false;
+}
+
+function findAddCourseButton() {
+  const direct = document.querySelector(
+    "#add_course, #btn_add_course, button[id*='add'][id*='course'], input[type='button'][value*='Add Course' i], input[type='submit'][value*='Add Course' i]"
+  );
+  if (direct && isElementVisible(direct)) return direct;
+
+  const candidates = Array.from(document.querySelectorAll("button, input[type='button'], input[type='submit'], a, .x-btn-text"));
+  return candidates.find((el) => {
+    if (!isElementVisible(el)) return false;
+    const text = String(el.textContent || el.innerText || el.value || el.getAttribute("title") || "").trim();
+    return /add\s*course/i.test(text);
+  }) || null;
+}
+
+async function clickYesConfirmationForIrregular(courseCode, section) {
+  for (let attempt = 0; attempt < 160; attempt += 1) {
+    const candidates = Array.from(document.querySelectorAll("button:not([disabled]), input[type='button']:not([disabled]), input[type='submit']:not([disabled]), .x-btn-text"));
+    const yesButton = candidates.find((el) => {
+      if (!isElementVisible(el)) return false;
+      const text = String(el.textContent || el.innerText || el.value || el.getAttribute("title") || "").trim();
+      if (!/^yes$/i.test(text)) return false;
+      const inDialog = Boolean(el.closest(".swal2-container, .x-window, .x-message-box, [role='dialog'], .modal"));
+      return inDialog;
+    });
+
+    if (yesButton) {
+      clickElementBestEffort(yesButton);
+      postOSESStatus("irregular_confirmed", `Confirmed add-course prompt for ${courseCode} ${section}.`, {
+        courseCode,
+        section,
+        source: "irregular-automation"
+      });
+      return true;
+    }
+
+    await waitMs(250);
+  }
+
+  return false;
+}
+
+function extractDialogOutcomeText() {
+  const containers = Array.from(document.querySelectorAll(".swal2-container, .x-window, .x-message-box, [role='dialog'], .modal"));
+  const text = containers
+    .map((node) => String(node.textContent || "").trim())
+    .filter(Boolean)
+    .join(" ")
+    .replace(/\s+/g, " ")
+    .trim();
+  return text;
+}
+
+function classifyDialogOutcome(text) {
+  const normalized = String(text || "").toLowerCase();
+  if (!normalized) return { status: "unknown", message: "" };
+
+  const success = /(success|added|enrolled|saved|registered|successfully)/i.test(normalized);
+  const failure = /(failed|error|cannot|unable|denied|conflict|not allowed|already enrolled|already taken|invalid)/i.test(normalized);
+
+  if (success && !failure) return { status: "success", message: text };
+  if (failure) return { status: "failure", message: text };
+  return { status: "unknown", message: text };
+}
+
+function readUnitsValue(selector) {
+  const el = document.querySelector(selector);
+  const raw = String(el?.textContent || "").trim();
+  const num = Number(raw.replace(/[^0-9]/g, ""));
+  return Number.isFinite(num) && num > 0 ? num : 0;
+}
+
+function hasReachedMaximumUnits() {
+  const total = readUnitsValue("#total-unit");
+  const maximum = readUnitsValue("#maximum");
+  if (!total || !maximum) return false;
+  return total >= maximum;
+}
+
+function isMaxUnitsDialogMessage(text) {
+  const normalized = String(text || "").toLowerCase();
+  if (!normalized) return false;
+  return /(maximum\s+units|max\s+units|allowed\s+units|exceed(ed|s)?\s+.*units|units\s+limit)/i.test(normalized);
+}
+
+async function waitForAddDialogOutcome(courseCode, section, runId, timeoutMs = 8000) {
+  const startedAt = Date.now();
+
+  while (Date.now() - startedAt <= timeoutMs) {
+    const text = extractDialogOutcomeText();
+    if (text) {
+      const outcome = classifyDialogOutcome(text);
+      if (outcome.status === "success") {
+        postOSESStatus("irregular_add_success_dialog", `Detected success dialog for ${courseCode} ${section}.`, {
+          source: "irregular-automation",
+          courseCode,
+          section,
+          runId,
+          dialogText: outcome.message
+        });
+        return outcome;
+      }
+
+      if (outcome.status === "failure") {
+        postOSESStatus("irregular_add_failed_dialog", `Detected failure dialog for ${courseCode} ${section}.`, {
+          source: "irregular-automation",
+          courseCode,
+          section,
+          runId,
+          dialogText: outcome.message
+        });
+        return outcome;
+      }
+    }
+
+    await waitMs(200);
+  }
+
+  return { status: "unknown", message: "" };
+}
+
+function isCourseInRegisteredList(courseCode, section) {
+  const normalizedCode = normalizeKey(courseCode);
+  const normalizedSection = normalizeKey(section);
+  if (!normalizedCode || !normalizedSection) return false;
+
+  const explicitRoots = Array.from(document.querySelectorAll("#enrolled-panel, #course_enrolled, #registered_courses"));
+  const inferredRegisteredPanels = Array.from(document.querySelectorAll(".x-panel, .x-panel-body, .x-grid-panel")).filter((panel) => {
+    const panelText = String(panel.textContent || "").toLowerCase();
+    const hasRegisteredLabel = panelText.includes("registered courses") || panelText.includes("course_enrolled");
+    const hasRows = Boolean(panel.querySelector(".x-grid3-row, tr"));
+    return hasRegisteredLabel && hasRows;
+  });
+
+  const roots = [...explicitRoots, ...inferredRegisteredPanels];
+  const searchRoots = roots.length ? roots : [document.documentElement || document.body];
+
+  const rowHasCourseCode = (row) => {
+    const courseCells = Array.from(
+      row.querySelectorAll(
+        ".x-grid3-cell-inner.x-grid3-col-course_enrolled, .x-grid3-cell-inner.x-grid3-col-course_open, .x-grid3-cell-inner.x-grid3-col-1"
+      )
+    );
+
+    if (courseCells.length) {
+      return courseCells.some((cell) => {
+        const key = normalizeKey(cell.textContent || "");
+        return key === normalizedCode || key.includes(normalizedCode);
+      });
+    }
+
+    const rowText = normalizeKey(row.textContent || "");
+    return rowText.includes(normalizedCode);
+  };
+
+  return searchRoots.some((root) => {
+    const sectionCells = Array.from(root.querySelectorAll(".x-grid3-cell-inner.x-grid3-col-3, .x-grid3-cell-inner.x-grid3-col-2"));
+
+    if (sectionCells.length) {
+      return sectionCells.some((sectionCell) => {
+        const sectionKey = normalizeKey(sectionCell.textContent || "");
+        const sectionMatched = sectionKey === normalizedSection || sectionKey.includes(normalizedSection);
+        if (!sectionMatched) return false;
+
+        const row = sectionCell.closest(".x-grid3-row") || sectionCell.closest("tr") || sectionCell.parentElement;
+        if (!row) return false;
+        return rowHasCourseCode(row);
+      });
+    }
+
+    const rows = Array.from(root.querySelectorAll(".x-grid3-row, tr"));
+    return rows.some((row) => {
+      const text = normalizeKey(row.textContent || "");
+      return text.includes(normalizedCode) && text.includes(normalizedSection);
+    });
+  });
+}
+
+async function waitForCourseInRegisteredList(courseCode, section, runId, timeoutMs = 15000) {
+  const startedAt = Date.now();
+  let attempts = 0;
+
+  while (Date.now() - startedAt <= timeoutMs) {
+    attempts += 1;
+    removeExtMaskIfPresent();
+
+    if (isCourseInRegisteredList(courseCode, section)) {
+      postOSESStatus("irregular_verified_added", `Verified ${courseCode} ${section} in registered courses.`, {
+        source: "irregular-automation",
+        courseCode,
+        section,
+        runId,
+        attempts
+      });
+      return true;
+    }
+
+    if (attempts === 1 || attempts % 10 === 0) {
+      postOSESStatus("irregular_verifying_added", `Verifying ${courseCode} ${section} in registered list...`, {
+        source: "irregular-automation",
+        courseCode,
+        section,
+        runId,
+        attempts
+      });
+    }
+
+    await waitMs(250);
+  }
+
+  return false;
+}
+
+async function saveIrregularProgressPatch(patch) {
+  const store = await readStorage(["osesIrregularProgress"]);
+  const current = store?.osesIrregularProgress || {};
+  safeStorageSet({
+    osesIrregularProgress: {
+      ...current,
+      ...patch,
+      updatedAt: Date.now()
+    }
+  });
+}
+
+async function runIrregularEnrollment() {
+  if (isTopWindow) return;
+  if (irregularAutomationState.inFlight) return;
+
+  if (await isIrregularAutomationPaused()) {
+    postOSESStatus("irregular_paused", "Irregular auto-add is paused. Press Start in popup to continue.", {
+      source: "irregular-automation"
+    });
+    await saveIrregularProgressPatch({
+      status: "paused",
+      prompt: {
+        showRetryChoice: false,
+        defaultChoice: "retry_once"
+      }
+    });
+    return;
+  }
+
+  irregularAutomationState.inFlight = true;
+  irregularAutomationState.stopRequested = false;
+
+  try {
+    const store = await readStorage(["osesIrregularEnrollmentRequest", "osesIrregularProgress", "osesIrregularRetryMode"]);
+    const request = store?.osesIrregularEnrollmentRequest;
+    if (!request?.isIrregular || !Array.isArray(request.queue) || !request.queue.length) return;
+
+    const runId = String(request.runId || "").trim();
+    if (!runId) return;
+    irregularAutomationState.runningRunId = runId;
+
+    const initialAdded = request.queue
+      .map((item) => ({
+        courseCode: String(item?.courseCode || "").trim().toUpperCase(),
+        section: String(item?.section || "").trim().toUpperCase()
+      }))
+      .filter((item) => item.courseCode && item.section)
+      .filter((item) => getRegisteredMatchState(item.courseCode, item.section).exact)
+      .map((item) => ({ ...item, source: "already-registered" }));
+
+    await saveIrregularProgressPatch({
+      runId,
+      status: "running",
+      currentIndex: 0,
+      total: request.queue.length,
+      added: initialAdded,
+      skipped: [],
+      conflicts: [],
+      missing: [],
+      prompt: {
+        showRetryChoice: false,
+        defaultChoice: "retry_once"
+      }
+    });
+
+    postOSESStatus("irregular_started", `Starting irregular add sequence for ${request.queue.length} course section(s).`, {
+      source: "irregular-automation",
+      runId
+    });
+
+    const added = [...initialAdded];
+    const skipped = [];
+    const conflicts = [];
+    const missing = [];
+
+    for (let index = 0; index < request.queue.length; index += 1) {
+      if (irregularAutomationState.stopRequested) break;
+
+      if (await isIrregularAutomationPaused()) {
+        postOSESStatus("irregular_paused", "Irregular auto-add was paused mid-run.", {
+          source: "irregular-automation",
+          runId
+        });
+        await saveIrregularProgressPatch({
+          status: "paused",
+          currentIndex: index,
+          added,
+          skipped,
+          conflicts,
+          missing,
+          prompt: {
+            showRetryChoice: false,
+            defaultChoice: "retry_once"
+          }
+        });
+        return;
+      }
+
+      const item = request.queue[index];
+      const courseCode = String(item.courseCode || "").trim().toUpperCase();
+      const section = String(item.section || "").trim().toUpperCase();
+      if (!courseCode || !section) continue;
+
+      await saveIrregularProgressPatch({ currentIndex: index + 1 });
+      postOSESStatus("irregular_processing", `Processing ${courseCode} ${section} (${index + 1}/${request.queue.length})...`, {
+        source: "irregular-automation",
+        courseCode,
+        section,
+        runId
+      });
+
+      const registeredState = getRegisteredMatchState(courseCode, section);
+      if (registeredState.exact) {
+        appendUniqueCourseSection(added, { courseCode, section, source: "already-registered" });
+        postOSESStatus("irregular_already_registered_skipped", `Skipped ${courseCode} ${section}: already in Registered Courses.`, {
+          source: "irregular-automation",
+          courseCode,
+          section,
+          runId
+        });
+        continue;
+      }
+
+      if (registeredState.conflict) {
+        conflicts.push({
+          courseCode,
+          section,
+          reason: "section-conflict",
+          conflictingSections: registeredState.conflictingSections
+        });
+        postOSESStatus(
+          "irregular_section_conflict_skipped",
+          `Skipped ${courseCode} ${section}: section conflict found (${registeredState.conflictingSections.join(", ")}). Remove conflicting section first, then add again.`,
+          {
+            source: "irregular-automation",
+            courseCode,
+            section,
+            runId,
+            conflictingSections: registeredState.conflictingSections
+          }
+        );
+        continue;
+      }
+
+      removeExtMaskIfPresent();
+
+      const groupTitle = findGridGroupByCourseCode(courseCode);
+      if (!groupTitle) {
+        missing.push({ courseCode, section, reason: "course-group-not-found" });
+        continue;
+      }
+
+      expandGroup(groupTitle);
+      const groupRoot = getGroupRoot(groupTitle);
+
+      let sectionCell = null;
+      for (let attempt = 0; attempt < 20; attempt += 1) {
+        sectionCell = findSectionCellInGroup(groupRoot, section);
+        if (sectionCell) break;
+        await waitMs(150);
+      }
+
+      if (!sectionCell) {
+        const availableSections = listSectionsInGroup(groupRoot);
+        postOSESStatus("irregular_section_not_found", `Section ${section} not found under course ${courseCode}.`, {
+          source: "irregular-automation",
+          courseCode,
+          section,
+          availableSections,
+          runId
+        });
+        missing.push({ courseCode, section, reason: "section-not-found" });
+        continue;
+      }
+
+      if (!selectSectionRowCheckbox(sectionCell)) {
+        skipped.push({ courseCode, section, reason: "available-but-selection-failed" });
+        continue;
+      }
+
+      const addCourseButton = findAddCourseButton();
+      if (!addCourseButton) {
+        skipped.push({ courseCode, section, reason: "available-but-add-button-missing" });
+        continue;
+      }
+
+      clickElementBestEffort(addCourseButton);
+      postOSESStatus("irregular_add_clicked", `Clicked Add Course for ${courseCode} ${section}.`, {
+        source: "irregular-automation",
+        courseCode,
+        section,
+        runId
+      });
+
+      const confirmed = await clickYesConfirmationForIrregular(courseCode, section);
+      if (!confirmed) {
+        skipped.push({ courseCode, section, reason: "available-but-confirmation-missing" });
+        continue;
+      }
+
+      const dialogOutcome = await waitForAddDialogOutcome(courseCode, section, runId);
+      if (dialogOutcome.status === "failure") {
+        const maxUnitsHit = isMaxUnitsDialogMessage(dialogOutcome.message) || hasReachedMaximumUnits();
+        skipped.push({
+          courseCode,
+          section,
+          reason: maxUnitsHit ? "max-units-reached" : "add-failed-dialog-after-available"
+        });
+        if (maxUnitsHit) {
+          postOSESStatus("irregular_max_units_skipped", `Skipped ${courseCode} ${section}: maximum units reached.`, {
+            source: "irregular-automation",
+            courseCode,
+            section,
+            runId
+          });
+        }
+        continue;
+      }
+
+      const verified = await waitForCourseInRegisteredList(courseCode, section, runId);
+      if (verified) {
+        appendUniqueCourseSection(added, { courseCode, section });
+      } else if (dialogOutcome.status === "success") {
+        // Grid refresh can lag even after success dialog; treat this as added and continue.
+        appendUniqueCourseSection(added, { courseCode, section, inferred: "success-dialog" });
+      } else {
+        const maxUnitsHit = hasReachedMaximumUnits() || isMaxUnitsDialogMessage(dialogOutcome.message);
+        skipped.push({
+          courseCode,
+          section,
+          reason: maxUnitsHit ? "max-units-reached" : "available-but-not-added"
+        });
+        if (maxUnitsHit) {
+          postOSESStatus("irregular_max_units_skipped", `Skipped ${courseCode} ${section}: maximum units reached.`, {
+            source: "irregular-automation",
+            courseCode,
+            section,
+            runId
+          });
+        }
+      }
+    }
+
+    const retryMode = store?.osesIrregularRetryMode === "retry_until_all" ? "retry_until_all" : "retry_once";
+    const showPrompt = missing.length > 0;
+
+    await saveIrregularProgressPatch({
+      status: showPrompt ? "awaiting_retry_decision" : "completed",
+      added,
+      skipped,
+      conflicts,
+      missing,
+      prompt: {
+        showRetryChoice: showPrompt,
+        defaultChoice: retryMode
+      }
+    });
+
+    if (showPrompt) {
+      postOSESStatus("irregular_retry_prompt", `Some irregular courses were not added (${missing.length}). Choose a retry mode to continue.`, {
+        source: "irregular-automation",
+        runId,
+        missingCount: missing.length
+      });
+    } else {
+      postOSESStatus("irregular_completed", `Irregular add sequence finished. Added ${added.length}, skipped ${skipped.length}, conflicts ${conflicts.length}.`, {
+        source: "irregular-automation",
+        runId,
+        addedCount: added.length,
+        skippedCount: skipped.length,
+        conflictCount: conflicts.length
+      });
+    }
+  } finally {
+    irregularAutomationState.inFlight = false;
+  }
+}
+
 function installFrameObserver() {
   if (isTopWindow || !document.documentElement) return;
 
@@ -644,6 +1283,13 @@ if (hasUsableExtensionContext()) {
     chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
       if (request.action === "startRegularBlockEnrollment") {
         runRegularBlockEnrollment()
+          .then(() => sendResponse({ success: true }))
+          .catch((error) => sendResponse({ success: false, error: error?.message || String(error) }));
+        return true;
+      }
+
+      if (request.action === "startIrregularEnrollment") {
+        runIrregularEnrollment()
           .then(() => sendResponse({ success: true }))
           .catch((error) => sendResponse({ success: false, error: error?.message || String(error) }));
         return true;
@@ -919,4 +1565,72 @@ if (!isTopWindow) {
   }
   installFrameObserver();
   installConfirmationObserver();
+}
+
+function getRegisteredCourseEntries() {
+  const roots = Array.from(document.querySelectorAll("#enrolled-panel, #course_enrolled, #registered_courses"));
+  const searchRoots = roots.length ? roots : [document.documentElement || document.body];
+  const entries = [];
+
+  searchRoots.forEach((root) => {
+    const rows = Array.from(root.querySelectorAll(".x-grid3-row, tr"));
+    rows.forEach((row) => {
+      const courseCell = row.querySelector(
+        ".x-grid3-cell-inner.x-grid3-col-course_enrolled, .x-grid3-cell-inner.x-grid3-col-course_open"
+      );
+      const sectionCell = row.querySelector(
+        ".x-grid3-cell-inner.x-grid3-col-3, .x-grid3-cell-inner.x-grid3-col-2"
+      );
+
+      const courseCode = String(courseCell?.textContent || "").trim().toUpperCase();
+      const section = String(sectionCell?.textContent || "").trim().toUpperCase();
+      if (!courseCode || !section) return;
+
+      entries.push({ courseCode, section });
+    });
+  });
+
+  return entries;
+}
+
+function getRegisteredMatchState(courseCode, section) {
+  const desiredCourse = normalizeKey(courseCode);
+  const desiredSection = normalizeKey(section);
+  if (!desiredCourse || !desiredSection) {
+    return { exact: false, conflict: false, conflictingSections: [] };
+  }
+
+  const entries = getRegisteredCourseEntries();
+  const sameCourse = entries.filter((entry) => normalizeKey(entry.courseCode) === desiredCourse);
+
+  if (!sameCourse.length) {
+    return { exact: false, conflict: false, conflictingSections: [] };
+  }
+
+  const exact = sameCourse.some((entry) => normalizeKey(entry.section) === desiredSection);
+  if (exact) {
+    return { exact: true, conflict: false, conflictingSections: [] };
+  }
+
+  const conflictingSections = sameCourse
+    .map((entry) => String(entry.section || "").trim().toUpperCase())
+    .filter(Boolean);
+
+  return {
+    exact: false,
+    conflict: conflictingSections.length > 0,
+    conflictingSections
+  };
+}
+
+function courseSectionKey(courseCode, section) {
+  return `${normalizeKey(courseCode)}__${normalizeKey(section)}`;
+}
+
+function appendUniqueCourseSection(list, item) {
+  if (!Array.isArray(list) || !item) return;
+  const key = courseSectionKey(item.courseCode, item.section);
+  if (!key || key === "__") return;
+  const exists = list.some((entry) => courseSectionKey(entry.courseCode, entry.section) === key);
+  if (!exists) list.push(item);
 }
