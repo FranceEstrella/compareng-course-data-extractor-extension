@@ -1,4 +1,4 @@
-console.log("Background script loaded! [build 1.1.0-oses-login-m1]");
+console.log("Background script loaded! [build 1.2.0-oses-login-m1]");
 
 self.addEventListener("unhandledrejection", (event) => {
     const reasonText = String(event?.reason?.message || event?.reason || "");

@@ -1,4 +1,4 @@
-console.log("Content script loaded! [build 1.1.0-oses-login-m1]");
+console.log("Content script loaded! [build 1.2.0-oses-login-m1]");
 
 const currentPath = window.location.pathname;
 const isOfferingsPage = currentPath.startsWith("/course/offerings");
