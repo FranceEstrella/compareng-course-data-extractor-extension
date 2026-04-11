@@ -46,14 +46,18 @@ function sendTabMessageSafe(tabId, payload) {
 
 function ensureDeveloperDefaults() {
     chrome.storage.local.get([
+        "osesNewFeaturesEnabled",
         "osesDeveloperMode",
         "osesRegularAutoAddPaused",
-        "osesIrregularAutoAddPaused"
+        "osesIrregularAutoAddPaused",
+        "osesGradeExtractionPaused"
     ], (result) => {
         const patch = {};
-        if (typeof result?.osesDeveloperMode !== "boolean") patch.osesDeveloperMode = true;
+        if (typeof result?.osesNewFeaturesEnabled !== "boolean") patch.osesNewFeaturesEnabled = false;
+        if (typeof result?.osesDeveloperMode !== "boolean") patch.osesDeveloperMode = false;
         if (typeof result?.osesRegularAutoAddPaused !== "boolean") patch.osesRegularAutoAddPaused = false;
         if (typeof result?.osesIrregularAutoAddPaused !== "boolean") patch.osesIrregularAutoAddPaused = false;
+        if (typeof result?.osesGradeExtractionPaused !== "boolean") patch.osesGradeExtractionPaused = false;
         if (Object.keys(patch).length > 0) {
             chrome.storage.local.set(patch);
         }
@@ -247,6 +251,296 @@ async function triggerRegularEnrollmentOnRegistrationTab() {
     await sendTabMessageSafe(target.id, { action: "startRegularBlockEnrollment" });
 }
 
+async function triggerGradeExtractionOnGradesTab() {
+    const tabs = await queryTabsSafe({ url: "https://solar.feutech.edu.ph/student/grades*" });
+    const target = tabs.find((tab) => typeof tab.id === "number" && tab.active) || tabs.find((tab) => typeof tab.id === "number");
+
+    if (!target || typeof target.id !== "number") {
+        throw new Error("Open the Student Grades page to run auto grade extraction.");
+    }
+
+    await sendTabMessageSafe(target.id, { action: "startGradeExtraction" });
+}
+
+function mergeGradeExtractionProgress(previousProgress, incomingProgress) {
+    const prev = previousProgress || {};
+    const incoming = incomingProgress || {};
+    const status = String(incoming?.stage || incoming?.status || "").toLowerCase();
+    const runChanged = Boolean(incoming?.runId) && String(incoming.runId) !== String(prev?.runId || "");
+
+    // New run or active running update must not carry stale fields from prior runs.
+    const resetForFreshRun = runChanged || status === "running";
+    const base = resetForFreshRun
+        ? {
+            ...prev,
+            stoppedAt: "",
+            error: "",
+            postedTargets: [],
+            completedAt: 0
+        }
+        : prev;
+
+    return {
+        ...base,
+        ...incoming,
+        updatedAt: Date.now()
+    };
+}
+
+function storeGradeExtractionProgress(progressUpdate, callback) {
+    chrome.storage.local.get(["osesGradeExtractionProgress"], (result) => {
+        const previous = result?.osesGradeExtractionProgress || {};
+        const next = mergeGradeExtractionProgress(previous, progressUpdate);
+        chrome.storage.local.set({ osesGradeExtractionProgress: next }, () => {
+            if (typeof callback === "function") callback(next);
+        });
+    });
+}
+
+async function writeGradeAttemptsToTabLocalStorage(tabId, payload) {
+    return new Promise((resolve) => {
+        try {
+            chrome.scripting.executeScript(
+                {
+                    target: { tabId },
+                    func: (injectedPayload) => {
+                        try {
+                            const safeRead = (key, fallback) => {
+                                try {
+                                    const raw = localStorage.getItem(key);
+                                    if (!raw) return fallback;
+                                    const parsed = JSON.parse(raw);
+                                    return parsed == null ? fallback : parsed;
+                                } catch {
+                                    return fallback;
+                                }
+                            };
+
+                            const safeWrite = (key, value) => {
+                                try {
+                                    localStorage.setItem(key, JSON.stringify(value));
+                                    return true;
+                                } catch {
+                                    return false;
+                                }
+                            };
+
+                            const sourcePayload = injectedPayload || {};
+                            const runId = String(sourcePayload?.runId || "").trim();
+                            const attempts = Array.isArray(sourcePayload?.attempts) ? sourcePayload.attempts : [];
+                            const extractedAt = Number(sourcePayload?.extractedAt || Date.now());
+                            const summary = sourcePayload?.summary || null;
+
+                            if (!runId || attempts.length === 0) {
+                                return { success: false, message: "Invalid payload in injected writer." };
+                            }
+
+                            const latest = {
+                                runId,
+                                attempts,
+                                summary,
+                                extractedAt,
+                                updatedAt: Date.now(),
+                                source: "compareng-course-data-extractor-extension"
+                            };
+
+                            const previousHistory = safeRead("comparengGradeAttemptsHistory", []);
+                            const history = Array.isArray(previousHistory) ? previousHistory : [];
+                            history.unshift({
+                                runId,
+                                extractedCount: attempts.length,
+                                attempts,
+                                summary,
+                                extractedAt,
+                                updatedAt: Date.now()
+                            });
+
+                            const latestOk = safeWrite("comparengGradeAttemptsLatest", latest);
+                            const historyOk = safeWrite("comparengGradeAttemptsHistory", history.slice(0, 30));
+                            const legacyAttemptsOk = safeWrite("gradeAttempts", attempts);
+                            const legacyPayloadOk = safeWrite("gradeAttemptsPayload", latest);
+
+                            try {
+                                window.dispatchEvent(new CustomEvent("compareng:gradeAttemptsUpdated", {
+                                    detail: { runId, extractedCount: attempts.length, extractedAt }
+                                }));
+                            } catch {
+                                // Ignore event dispatch issues.
+                            }
+
+                            try {
+                                document.dispatchEvent(new CustomEvent("compareng:gradeAttemptsUpdated", {
+                                    detail: { runId, extractedCount: attempts.length, extractedAt }
+                                }));
+                            } catch {
+                                // Ignore event dispatch issues.
+                            }
+
+                            try {
+                                window.postMessage(
+                                    {
+                                        source: "compareng-course-data-extractor-extension",
+                                        type: "gradeAttemptsUpdated",
+                                        detail: { runId, extractedCount: attempts.length, extractedAt }
+                                    },
+                                    "*"
+                                );
+                            } catch {
+                                // Ignore postMessage issues.
+                            }
+
+                            try {
+                                window.dispatchEvent(new StorageEvent("storage", { key: "comparengGradeAttemptsLatest" }));
+                                window.dispatchEvent(new StorageEvent("storage", { key: "comparengGradeAttemptsHistory" }));
+                                window.dispatchEvent(new StorageEvent("storage", { key: "gradeAttempts" }));
+                                window.dispatchEvent(new StorageEvent("storage", { key: "gradeAttemptsPayload" }));
+                            } catch {
+                                // Some environments do not allow synthetic StorageEvent.
+                            }
+
+                            if (!latestOk || !historyOk || !legacyAttemptsOk || !legacyPayloadOk) {
+                                return { success: false, message: "Failed writing localStorage in injected writer." };
+                            }
+
+                            return {
+                                success: true,
+                                runId,
+                                storedCount: attempts.length,
+                                storageKeys: [
+                                    "comparengGradeAttemptsLatest",
+                                    "comparengGradeAttemptsHistory",
+                                    "gradeAttempts",
+                                    "gradeAttemptsPayload"
+                                ]
+                            };
+                        } catch (error) {
+                            return { success: false, message: error?.message || String(error) };
+                        }
+                    },
+                    args: [payload]
+                },
+                (injectionResults) => {
+                    const runtimeError = chrome.runtime.lastError;
+                    if (runtimeError) {
+                        resolve({ success: false, message: runtimeError.message || "Script injection failed." });
+                        return;
+                    }
+
+                    const first = Array.isArray(injectionResults) ? injectionResults[0] : null;
+                    const result = first?.result || { success: false, message: "No script result returned." };
+                    resolve(result);
+                }
+            );
+        } catch (error) {
+            resolve({ success: false, message: error?.message || String(error) });
+        }
+    });
+}
+
+function normalizeGradeAttempts(rawAttempts) {
+    const attempts = Array.isArray(rawAttempts) ? rawAttempts : [];
+    const deduped = [];
+    const seen = new Set();
+
+    attempts.forEach((attempt) => {
+        const courseCode = String(attempt?.courseCode || "").trim().toUpperCase();
+        const finalGrade = String(attempt?.finalGrade || "").trim();
+        const schoolYear = String(attempt?.schoolYear || "").trim();
+        const portalTermLabel = String(attempt?.portalTermLabel || "").trim();
+        const chronologicalIndex = Number(attempt?.chronologicalIndex || 0);
+
+        if (!courseCode || !finalGrade) return;
+
+        const key = `${courseCode}__${schoolYear.toLowerCase()}__${portalTermLabel.toLowerCase()}`;
+        if (seen.has(key)) return;
+        seen.add(key);
+
+        deduped.push({
+            courseCode,
+            finalGrade,
+            schoolYear,
+            portalTermLabel,
+            chronologicalIndex
+        });
+    });
+
+    return deduped.sort((a, b) => Number(a?.chronologicalIndex || 0) - Number(b?.chronologicalIndex || 0));
+}
+
+async function postGradeAttemptsToTargets(payload) {
+    const webAppPatterns = [
+        "http://localhost:3000/*",
+        "http://127.0.0.1/*",
+        "https://compareng-tools.vercel.app/*",
+        "https://compareng-coursetracker.vercel.app/*"
+    ];
+
+    const tabsById = new Map();
+    const tabCollections = await Promise.allSettled(
+        webAppPatterns.map((pattern) => queryTabsSafe({ url: pattern }))
+    );
+
+    tabCollections.forEach((result) => {
+        if (result.status !== "fulfilled") return;
+        result.value.forEach((tab) => {
+            if (typeof tab?.id !== "number") return;
+            tabsById.set(tab.id, tab);
+        });
+    });
+
+    const tabs = Array.from(tabsById.values());
+    if (!tabs.length) {
+        return [{
+            url: "webapp-tabs",
+            ok: false,
+            response: null,
+            error: "No ComParEng web app tab is open. Open the app first to receive grade data in localStorage."
+        }];
+    }
+
+    const settled = await Promise.allSettled(
+        tabs.map(async (tab) => {
+            try {
+                const response = await sendTabMessageSafe(tab.id, {
+                    action: "storeGradeAttemptsInLocalStorage",
+                    data: payload
+                });
+
+                if (response?.success) {
+                    return { tab, response };
+                }
+
+                const fallback = await writeGradeAttemptsToTabLocalStorage(tab.id, payload);
+                return { tab, response: fallback };
+            } catch {
+                const fallback = await writeGradeAttemptsToTabLocalStorage(tab.id, payload);
+                return { tab, response: fallback };
+            }
+        })
+    );
+
+    return settled.map((result, index) => {
+        const tab = tabs[index];
+        const tabTarget = `${tab?.url || "tab"}#${tab?.id || "unknown"}`;
+
+        if (result.status === "fulfilled") {
+            return {
+                url: tabTarget,
+                ok: Boolean(result.value?.response?.success),
+                response: result.value?.response || null,
+                error: null
+            };
+        }
+
+        return {
+            url: tabTarget,
+            ok: false,
+            response: null,
+            error: result.reason?.message || String(result.reason || "Unknown error")
+        };
+    });
+}
+
 function setAutomationControl(target, paused) {
     const isPaused = paused === true;
 
@@ -257,6 +551,11 @@ function setAutomationControl(target, paused) {
 
     if (target === "irregular") {
         chrome.storage.local.set({ osesIrregularAutoAddPaused: isPaused });
+        return { target, paused: isPaused };
+    }
+
+    if (target === "grades") {
+        chrome.storage.local.set({ osesGradeExtractionPaused: isPaused });
         return { target, paused: isPaused };
     }
 
@@ -407,11 +706,130 @@ chrome.runtime.onMessage.addListener(function(request, sender, sendResponse) {
                 return true;
             }
 
+            if (!paused && target === "grades") {
+                storeGradeExtractionProgress({
+                    stage: "running",
+                    status: "running",
+                    stoppedAt: "",
+                    error: "",
+                    postedTargets: [],
+                    extractedAttempts: [],
+                    extractedCount: 0,
+                    startedAt: Date.now()
+                });
+                triggerGradeExtractionOnGradesTab()
+                    .then(() => sendResponse({ success: true, data: state }))
+                    .catch((error) => sendResponse({ success: false, message: error?.message || String(error) }));
+                return true;
+            }
+
             sendResponse({ success: true, data: state });
         } catch (error) {
             sendResponse({ success: false, message: error?.message || String(error) });
         }
         return false;
+    }
+
+    if (request.action === "startOSESGradeExtraction") {
+        storeGradeExtractionProgress({
+            stage: "running",
+            status: "running",
+            stoppedAt: "",
+            error: "",
+            postedTargets: [],
+            extractedAttempts: [],
+            extractedCount: 0,
+            startedAt: Date.now()
+        });
+        triggerGradeExtractionOnGradesTab()
+            .then(() => sendResponse({ success: true }))
+            .catch((error) => sendResponse({ success: false, message: error?.message || String(error) }));
+        return true;
+    }
+
+    if (request.action === "osesGradeExtractionStatus") {
+        const statusPayload = request.data || {};
+        storeGradeExtractionProgress(statusPayload);
+        sendResponse({ success: true });
+        return false;
+    }
+
+    if (request.action === "gradeAttemptsExtracted") {
+        const payload = request.data || {};
+        const runId = String(payload?.runId || "").trim();
+        const attempts = Array.isArray(payload?.attempts) ? payload.attempts : [];
+        const normalizedAttempts = normalizeGradeAttempts(attempts);
+
+        if (!runId || normalizedAttempts.length === 0) {
+            sendResponse({ success: false, message: "Invalid grade extraction payload." });
+            return false;
+        }
+
+        postGradeAttemptsToTargets({
+            runId,
+            attempts: normalizedAttempts,
+            summary: payload?.summary || null,
+            extractedAt: Number(payload?.extractedAt || Date.now())
+        })
+            .then((targets) => {
+                const anySuccess = targets.some((item) => item.ok);
+                const status = {
+                    status: anySuccess ? "completed" : "error",
+                    stage: anySuccess ? "completed" : "error",
+                    extractedCount: normalizedAttempts.length,
+                    extractedRawCount: attempts.length,
+                    extractedAttempts: normalizedAttempts.slice(0, 600).map((attempt) => ({
+                        courseCode: String(attempt?.courseCode || "").trim(),
+                        finalGrade: String(attempt?.finalGrade || "").trim(),
+                        schoolYear: String(attempt?.schoolYear || "").trim(),
+                        portalTermLabel: String(attempt?.portalTermLabel || "").trim(),
+                        chronologicalIndex: Number(attempt?.chronologicalIndex || 0)
+                    })),
+                    postedTargets: targets,
+                    runId,
+                    completedAt: Date.now(),
+                    error: anySuccess ? "" : (targets.find((t) => t.error)?.error || "Failed to post grade attempts.")
+                };
+
+                storeGradeExtractionProgress(status, () => {
+                    if (anySuccess) {
+                        chrome.action.setBadgeText({ text: "OK" });
+                        chrome.action.setBadgeBackgroundColor({ color: "#16a34a" });
+                        try {
+                            chrome.notifications.create({
+                                type: "basic",
+                                iconUrl: "images/icon128.png",
+                                title: "Grade Extraction Complete",
+                                message: `Extracted ${normalizedAttempts.length} attempt(s) and sent to ComParEng Tools.`
+                            });
+                        } catch {
+                            // Notifications can fail on some Chromium builds.
+                        }
+                    } else {
+                        chrome.action.setBadgeText({ text: "ERR" });
+                        chrome.action.setBadgeBackgroundColor({ color: "#dc2626" });
+                    }
+                });
+
+                sendResponse({
+                    success: anySuccess,
+                    targets,
+                    extractedCount: normalizedAttempts.length,
+                    extractedRawCount: attempts.length
+                });
+            })
+            .catch((error) => {
+                storeGradeExtractionProgress({
+                    status: "error",
+                    stage: "error",
+                    error: error?.message || String(error),
+                    runId,
+                    completedAt: Date.now()
+                });
+                sendResponse({ success: false, message: error?.message || String(error) });
+            });
+
+        return true;
     }
 
     if (request.action === "retryOSESIrregularEnrollment") {
@@ -524,7 +942,11 @@ chrome.runtime.onMessage.addListener(function(request, sender, sendResponse) {
 
 chrome.runtime.onMessageExternal.addListener((request, sender, sendResponse) => {
     const externalAction = request?.action;
-    if (externalAction !== "setOSESBlockEnrollmentRequest" && externalAction !== "setOSESIrregularEnrollmentRequest") return false;
+    if (
+        externalAction !== "setOSESBlockEnrollmentRequest" &&
+        externalAction !== "setOSESIrregularEnrollmentRequest" &&
+        externalAction !== "startOSESGradeExtraction"
+    ) return false;
 
     const senderUrl = String(sender?.url || "");
     const trustedSender = isTrustedExternalSenderUrl(senderUrl);
@@ -535,6 +957,13 @@ chrome.runtime.onMessageExternal.addListener((request, sender, sendResponse) => 
     }
 
     try {
+        if (externalAction === "startOSESGradeExtraction") {
+            triggerGradeExtractionOnGradesTab()
+                .then(() => sendResponse({ success: true }))
+                .catch((error) => sendResponse({ success: false, message: error?.message || String(error) }));
+            return true;
+        }
+
         if (externalAction === "setOSESIrregularEnrollmentRequest") {
             const saved = persistIrregularEnrollmentRequest(request.data);
             storeAutomationStatus({

@@ -17,7 +17,7 @@
       background: linear-gradient(to bottom, #003366, #006699);
   color: #fff;
       width: 360px;
-      min-height: 100%;
+      height: auto;
       overflow: hidden;
 }
 
@@ -28,7 +28,7 @@
   box-shadow: none;
   text-align: center;
       width: 100%;
-      min-height: 100%;
+    height: auto;
   box-sizing: border-box;
   border: none;
   display: flex;
@@ -318,7 +318,8 @@ h1 {
   font-weight: 700;
 }
 
-#irregular-wrap {
+#irregular-wrap,
+#grade-import-wrap {
   width: 100%;
   border: 1px solid rgba(191, 219, 254, 0.35);
   background: rgba(2, 6, 23, 0.2);
@@ -416,6 +417,16 @@ h1 {
   border-radius: 6px;
   padding: 6px;
   max-height: 120px;
+  overflow-y: auto;
+  background: rgba(2, 6, 23, 0.18);
+}
+
+#grade-import-list {
+  margin-top: 8px;
+  border: 1px dashed rgba(191, 219, 254, 0.35);
+  border-radius: 6px;
+  padding: 6px;
+  max-height: 180px;
   overflow-y: auto;
   background: rgba(2, 6, 23, 0.18);
 }
@@ -604,6 +615,14 @@ h1 {
   height: 18px;
   object-fit: contain;
 }
+
+#turn-on-new-features {
+  padding: 2px;
+  min-height: 8px;
+  font-size: 0;
+  line-height: 0;
+  margin: 0;
+}
   </style>
 </head>
 <body>
@@ -646,6 +665,11 @@ h1 {
         <button id="irregular-retry-until-all" class="irregular-button" type="button" disabled>Retry Until All</button>
       </div>
     </div>
+    <div id="grade-import-wrap">
+      <div class="oses-title">Auto Grade Extractor</div>
+      <div id="grade-import-summary">No grade extraction run yet.</div>
+      <div id="grade-import-list" class="irregular-empty">No completed grade import run yet.</div>
+    </div>
     <div id="developer-wrap">
       <div class="developer-header">
         <div class="oses-title">Developer Mode</div>
@@ -668,6 +692,10 @@ h1 {
             <span class="control-label">Irregular Auto-Add</span>
             <button id="irregular-toggle" class="control-toggle running" type="button">Pause</button>
           </div>
+          <div class="control-row">
+            <span class="control-label">Grade Auto-Import</span>
+            <button id="grades-toggle" class="control-toggle running" type="button">Pause</button>
+          </div>
         </div>
       </div>
     </div>
@@ -680,6 +708,9 @@ h1 {
         <img src="images/default_icon.png" alt="Portal" class="button-icon" />
         Student Portal
       </a>
+      <button id="turn-on-new-features" class="button" type="button">
+        Turn On New Features
+      </button>
     </div>
   </div>
 

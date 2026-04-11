@@ -95,9 +95,16 @@ const SUCCESS_STAGES = new Set([
 
 function safeRuntimeSendMessage(payload, callback) {
 	try {
+		if (!chrome?.runtime?.id) return false;
+	} catch {
+		return false;
+	}
+
+	try {
 		chrome.runtime.sendMessage(payload, (response) => {
 			const runtimeError = chrome.runtime.lastError;
 			if (runtimeError) {
+				// MV3 service worker can be unavailable briefly while reloading.
 				if (typeof callback === "function") callback({ success: false, message: runtimeError.message, runtimeError: true });
 				return;
 			}
@@ -109,6 +116,197 @@ function safeRuntimeSendMessage(payload, callback) {
 		if (typeof callback === "function") callback({ success: false, message: error?.message || String(error), runtimeError: true });
 		return false;
 	}
+}
+
+function syncPopupHeightToContent() {
+	requestAnimationFrame(() => {
+		const docEl = document.documentElement;
+		const body = document.body;
+		if (!docEl || !body) return;
+
+		// Reset first, then apply exact content height so the popup shrinks when sections are hidden.
+		docEl.style.height = "auto";
+		body.style.height = "auto";
+
+		const contentHeight = Math.max(body.scrollHeight, docEl.scrollHeight);
+		docEl.style.height = `${contentHeight}px`;
+		body.style.height = `${contentHeight}px`;
+	});
+}
+
+function setNewFeaturesVisibility(enabled) {
+	const osesStatusWrap = document.getElementById("oses-status-wrap");
+	const osesInfoWrap = document.getElementById("oses-info-wrap");
+	const irregularWrap = document.getElementById("irregular-wrap");
+	const gradeImportWrap = document.getElementById("grade-import-wrap");
+	const developerWrap = document.getElementById("developer-wrap");
+	const turnOnButton = document.getElementById("turn-on-new-features");
+
+	const hiddenDisplay = enabled ? "" : "none";
+	if (osesStatusWrap) osesStatusWrap.style.display = hiddenDisplay;
+	if (osesInfoWrap) osesInfoWrap.style.display = hiddenDisplay;
+	if (irregularWrap) irregularWrap.style.display = hiddenDisplay;
+	if (gradeImportWrap) gradeImportWrap.style.display = hiddenDisplay;
+	if (developerWrap) developerWrap.style.display = hiddenDisplay;
+
+	if (turnOnButton) {
+		turnOnButton.style.display = "";
+		turnOnButton.style.opacity = "0";
+		turnOnButton.style.pointerEvents = "auto";
+		turnOnButton.textContent = enabled ? "Turn Off New Features" : "Turn On New Features";
+	}
+
+	syncPopupHeightToContent();
+}
+
+function renderNewFeaturesGate() {
+	chrome.storage.local.get(["osesNewFeaturesEnabled"], (result) => {
+		const enabled = result?.osesNewFeaturesEnabled === true;
+		setNewFeaturesVisibility(enabled);
+	});
+}
+
+function setNewFeaturesEnabled(enabled) {
+	chrome.storage.local.set({ osesNewFeaturesEnabled: enabled === true }, () => {
+		renderNewFeaturesGate();
+		renderOSESStatus();
+		renderOSESInfo();
+		renderIrregularStatus();
+		renderIrregularCourseList();
+		renderGradeExtractionStatus();
+		renderDeveloperMode();
+		renderAutomationControls();
+	});
+}
+
+function renderGradeExtractionStatus() {
+	const summaryEl = document.getElementById("grade-import-summary");
+	const listEl = document.getElementById("grade-import-list");
+	if (!summaryEl || !listEl) return;
+
+	chrome.storage.local.get(["osesGradeExtractionProgress"], (result) => {
+		const progress = result?.osesGradeExtractionProgress || {};
+		const status = String(progress?.stage || progress?.status || "idle").toLowerCase();
+		const extractedCount = Number(progress?.extractedCount || 0);
+		const extractedRawCount = Number(progress?.extractedRawCount || extractedCount || 0);
+		const wasDeduped = extractedRawCount > extractedCount;
+		const currentTerm = String(progress?.currentTermLabel || "").trim();
+		const stoppedAt = String(progress?.stoppedAt || "").trim();
+		const showCurrent = status === "running" && Boolean(currentTerm);
+		const showStoppedAt = (status === "paused" || status === "error" || status === "completed") && Boolean(stoppedAt);
+
+		const statusTone = status === "completed"
+			? "status-completed"
+			: status === "running"
+				? "status-running"
+				: status === "paused"
+					? "status-paused"
+					: "status-decision";
+
+		summaryEl.innerHTML = `
+			<div class="irreg-summary-line">
+				<span class="irreg-summary-pill ${statusTone}">Status: ${status || "idle"}</span>
+				<span class="irreg-summary-pill metric-added">Extracted: ${extractedCount}</span>
+			</div>
+			${wasDeduped ? `<div class="irreg-summary-line"><span class="irreg-summary-pill metric-skipped">Deduped from: ${extractedRawCount}</span></div>` : ""}
+			${showCurrent ? `<div class="irreg-summary-line"><span class="irreg-summary-pill">Current: ${currentTerm}</span></div>` : ""}
+			${showStoppedAt ? `<div class="irreg-summary-line"><span class="irreg-summary-pill metric-missing">Stopped at: ${stoppedAt}</span></div>` : ""}
+		`;
+
+		const attempts = Array.isArray(progress?.extractedAttempts) ? progress.extractedAttempts : [];
+		const targets = Array.isArray(progress?.postedTargets) ? progress.postedTargets : [];
+		if (!attempts.length && !targets.length) {
+			listEl.className = "irregular-empty";
+			listEl.textContent = "No completed grade import run yet.";
+			return;
+		}
+
+		listEl.className = "";
+		listEl.innerHTML = "";
+
+		if (attempts.length) {
+			const grouped = new Map();
+			attempts.forEach((attempt) => {
+				const schoolYear = String(attempt?.schoolYear || "Unknown School Year").trim() || "Unknown School Year";
+				const termLabel = String(attempt?.portalTermLabel || "Unknown Term").trim() || "Unknown Term";
+				const key = `${schoolYear}::${termLabel}`;
+				if (!grouped.has(key)) grouped.set(key, { schoolYear, termLabel, items: [] });
+				grouped.get(key).items.push(attempt);
+			});
+
+			Array.from(grouped.values()).forEach((group) => {
+				const header = document.createElement("div");
+				header.className = "irregular-course-row state-in-progress";
+
+				const left = document.createElement("span");
+				left.className = "irregular-course-code";
+				left.textContent = `${group.termLabel} - ${group.schoolYear}`;
+
+				const right = document.createElement("span");
+				right.className = "irregular-course-status";
+				right.textContent = `${group.items.length} item(s)`;
+
+				header.appendChild(left);
+				header.appendChild(right);
+				listEl.appendChild(header);
+
+				group.items
+					.sort((a, b) => Number(a?.chronologicalIndex || 0) - Number(b?.chronologicalIndex || 0))
+					.forEach((item) => {
+						const row = document.createElement("div");
+						row.className = "irregular-course-row state-added";
+
+						const code = document.createElement("span");
+						code.className = "irregular-course-code";
+						code.textContent = String(item?.courseCode || "UNKNOWN");
+
+						const grade = document.createElement("span");
+						grade.className = "irregular-course-status";
+						grade.textContent = `Grade ${String(item?.finalGrade || "-")}`;
+
+						row.appendChild(code);
+						row.appendChild(grade);
+						listEl.appendChild(row);
+					});
+			});
+		}
+
+		if (targets.length) {
+			const targetHeader = document.createElement("div");
+			targetHeader.className = "irregular-course-row";
+
+			const left = document.createElement("span");
+			left.className = "irregular-course-code";
+			left.textContent = "Post Targets";
+
+			targetHeader.appendChild(left);
+			listEl.appendChild(targetHeader);
+
+			targets.forEach((target) => {
+				const row = document.createElement("div");
+				row.className = `irregular-course-row ${target?.ok ? "state-added" : "state-conflict"}`;
+
+				const tLeft = document.createElement("span");
+				tLeft.className = "irregular-course-code";
+				tLeft.textContent = target?.url || "target";
+
+				const tRight = document.createElement("span");
+				tRight.className = "irregular-course-status";
+				tRight.textContent = target?.ok ? "Posted" : "Failed";
+
+				row.appendChild(tLeft);
+				row.appendChild(tRight);
+				listEl.appendChild(row);
+			});
+		}
+	});
+}
+
+function toggleNewFeatures() {
+	chrome.storage.local.get(["osesNewFeaturesEnabled"], (result) => {
+		const enabled = result?.osesNewFeaturesEnabled === true;
+		setNewFeaturesEnabled(!enabled);
+	});
 }
 
 function renderFetchedStatus() {
@@ -415,7 +613,7 @@ function renderDeveloperMode() {
 	if (!modeEl || !wrap || !toggle) return;
 
 	chrome.storage.local.get(["osesDeveloperMode"], (result) => {
-		const isOn = result?.osesDeveloperMode !== false;
+		const isOn = result?.osesDeveloperMode === true;
 		modeEl.textContent = isOn ? "ON" : "OFF";
 		modeEl.style.color = isOn ? "#86efac" : "#fca5a5";
 		toggle.checked = isOn;
@@ -427,15 +625,18 @@ function setDeveloperModeEnabled(enabled) {
 	const isOn = enabled === true;
 	const regularPaused = isOn;
 	const irregularPaused = isOn;
+	const gradesPaused = isOn;
 
 	chrome.storage.local.set({
 		osesDeveloperMode: isOn,
 		osesRegularAutoAddPaused: regularPaused,
-		osesIrregularAutoAddPaused: irregularPaused
+		osesIrregularAutoAddPaused: irregularPaused,
+		osesGradeExtractionPaused: gradesPaused
 	}, () => {
 		renderDeveloperMode();
 		renderAutomationControls();
 		renderIrregularStatus();
+		renderGradeExtractionStatus();
 		renderOSESStatus();
 	});
 }
@@ -449,18 +650,25 @@ function applyControlButtonState(button, paused) {
 function renderAutomationControls() {
 	const regularBtn = document.getElementById("regular-toggle");
 	const irregularBtn = document.getElementById("irregular-toggle");
-	if (!regularBtn || !irregularBtn) return;
+	const gradesBtn = document.getElementById("grades-toggle");
+	if (!regularBtn || !irregularBtn || !gradesBtn) return;
 
-	chrome.storage.local.get(["osesRegularAutoAddPaused", "osesIrregularAutoAddPaused"], (result) => {
+	chrome.storage.local.get(["osesRegularAutoAddPaused", "osesIrregularAutoAddPaused", "osesGradeExtractionPaused"], (result) => {
 		const regularPaused = result?.osesRegularAutoAddPaused === true;
 		const irregularPaused = result?.osesIrregularAutoAddPaused === true;
+		const gradesPaused = result?.osesGradeExtractionPaused === true;
 		applyControlButtonState(regularBtn, regularPaused);
 		applyControlButtonState(irregularBtn, irregularPaused);
+		applyControlButtonState(gradesBtn, gradesPaused);
 	});
 }
 
 function toggleAutomationControl(target) {
-	const key = target === "regular" ? "osesRegularAutoAddPaused" : "osesIrregularAutoAddPaused";
+	const key = target === "regular"
+		? "osesRegularAutoAddPaused"
+		: target === "irregular"
+			? "osesIrregularAutoAddPaused"
+			: "osesGradeExtractionPaused";
 	chrome.storage.local.get([key], (result) => {
 		const currentlyPaused = result?.[key] === true;
 		safeRuntimeSendMessage({
@@ -473,6 +681,7 @@ function toggleAutomationControl(target) {
 			renderAutomationControls();
 			renderOSESStatus();
 			renderIrregularStatus();
+			renderGradeExtractionStatus();
 		});
 	});
 }
@@ -494,12 +703,19 @@ function runOSESRetry() {
 }
 
 document.addEventListener("DOMContentLoaded", () => {
+	renderNewFeaturesGate();
 	renderOSESStatus();
 	renderOSESInfo();
 	renderIrregularStatus();
 	renderIrregularCourseList();
+	renderGradeExtractionStatus();
 	renderDeveloperMode();
 	renderAutomationControls();
+
+	const turnOnNewFeaturesBtn = document.getElementById("turn-on-new-features");
+	if (turnOnNewFeaturesBtn) {
+		turnOnNewFeaturesBtn.addEventListener("click", toggleNewFeatures);
+	}
 
 	const retryButton = document.getElementById("oses-retry");
 	if (retryButton) {
@@ -524,6 +740,11 @@ document.addEventListener("DOMContentLoaded", () => {
 	const irregularToggleBtn = document.getElementById("irregular-toggle");
 	if (irregularToggleBtn) {
 		irregularToggleBtn.addEventListener("click", () => toggleAutomationControl("irregular"));
+	}
+
+	const gradesToggleBtn = document.getElementById("grades-toggle");
+	if (gradesToggleBtn) {
+		gradesToggleBtn.addEventListener("click", () => toggleAutomationControl("grades"));
 	}
 
 	const developerModeToggle = document.getElementById("developer-mode-toggle");
@@ -554,8 +775,16 @@ chrome.storage.onChanged.addListener((changes, areaName) => {
 		renderIrregularStatus();
 	}
 
-	if (changes.osesRegularAutoAddPaused || changes.osesIrregularAutoAddPaused || changes.osesDeveloperMode) {
+	if (changes.osesGradeExtractionProgress) {
+		renderGradeExtractionStatus();
+	}
+
+	if (changes.osesRegularAutoAddPaused || changes.osesIrregularAutoAddPaused || changes.osesGradeExtractionPaused || changes.osesDeveloperMode) {
 		renderDeveloperMode();
 		renderAutomationControls();
+	}
+
+	if (changes.osesNewFeaturesEnabled) {
+		renderNewFeaturesGate();
 	}
 });

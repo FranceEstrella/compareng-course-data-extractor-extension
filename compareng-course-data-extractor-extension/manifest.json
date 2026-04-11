@@ -14,7 +14,9 @@
 
     "permissions": [
       "storage",
-      "tabs"
+      "tabs",
+      "scripting",
+      "notifications"
     ],
 
     "content_scripts": [
@@ -30,6 +32,19 @@
           "content.js"
         ],
         "all_frames": true,
+        "run_at": "document_idle"
+      },
+      {
+        "matches": [
+          "http://localhost:3000/*",
+          "http://127.0.0.1/*",
+          "https://compareng-tools.vercel.app/*",
+          "https://compareng-coursetracker.vercel.app/*"
+        ],
+        "js": [
+          "webapp-bridge.js"
+        ],
+        "all_frames": false,
         "run_at": "document_idle"
       }
     ],
