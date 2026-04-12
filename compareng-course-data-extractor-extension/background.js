@@ -1,5 +1,109 @@
 console.log("Background script loaded! [build 1.2.0-oses-login-m1]");
 
+const COURSE_DATA_UPLOAD_TARGETS = {
+    dual: {
+        label: "Localhost + Production",
+        urls: [
+            "http://localhost:3000/api/receive-course-data",
+            "https://compareng-tools.vercel.app/api/receive-course-data"
+        ]
+    },
+    localhost: {
+        label: "Localhost",
+        urls: ["http://localhost:3000/api/receive-course-data"]
+    },
+    localhost127: {
+        label: "127.0.0.1",
+        urls: ["http://127.0.0.1:3000/api/receive-course-data"]
+    },
+    production: {
+        label: "Production",
+        urls: ["https://compareng-tools.vercel.app/api/receive-course-data"]
+    },
+    legacy: {
+        label: "Legacy",
+        urls: ["https://compareng-coursetracker.vercel.app/api/receive-course-data"]
+    },
+    custom: {
+        label: "Custom",
+        urls: []
+    }
+};
+
+function getLoopbackAlternativeUrl(rawUrl) {
+    try {
+        const parsed = new URL(String(rawUrl || ""));
+        if (parsed.protocol !== "http:") return "";
+
+        if (parsed.hostname === "localhost") {
+            parsed.hostname = "127.0.0.1";
+            return parsed.toString();
+        }
+
+        if (parsed.hostname === "127.0.0.1") {
+            parsed.hostname = "localhost";
+            return parsed.toString();
+        }
+    } catch {
+        return "";
+    }
+
+    return "";
+}
+
+async function postCourseDataToUrl(url, courseData) {
+    const response = await fetch(url, {
+        method: "POST",
+        headers: {
+            "Content-Type": "application/json"
+        },
+        body: JSON.stringify(courseData)
+    });
+
+    if (!response.ok) {
+        const bodyText = await response.text().catch(() => "");
+        throw new Error(`HTTP ${response.status} from ${url}: ${bodyText || "No response body"}`);
+    }
+
+    const contentType = String(response.headers.get("content-type") || "").toLowerCase();
+    if (contentType.includes("application/json")) {
+        return response.json();
+    }
+
+    const bodyText = await response.text().catch(() => "");
+    return {
+        success: true,
+        message: bodyText || "OK"
+    };
+}
+
+async function postCourseDataWithLoopbackFallback(url, courseData) {
+    try {
+        const data = await postCourseDataToUrl(url, courseData);
+        return { url, effectiveUrl: url, usedFallback: false, data };
+    } catch (primaryError) {
+        const primaryMessage = String(primaryError?.message || primaryError || "Unknown error");
+        const fallbackUrl = getLoopbackAlternativeUrl(url);
+        const shouldTryFallback = Boolean(fallbackUrl) && /failed to fetch|networkerror/i.test(primaryMessage);
+
+        if (shouldTryFallback) {
+            try {
+                const data = await postCourseDataToUrl(fallbackUrl, courseData);
+                return { url, effectiveUrl: fallbackUrl, usedFallback: true, data };
+            } catch (fallbackError) {
+                const fallbackMessage = String(fallbackError?.message || fallbackError || "Unknown error");
+                throw new Error(`${primaryMessage} | Fallback ${fallbackUrl} failed: ${fallbackMessage}`);
+            }
+        }
+
+        if (/failed to fetch|networkerror/i.test(primaryMessage)) {
+            throw new Error(`${primaryMessage}. Ensure your local API is running and reachable at ${url}.`);
+        }
+
+        throw primaryError;
+    }
+}
+
 self.addEventListener("unhandledrejection", (event) => {
     const reasonText = String(event?.reason?.message || event?.reason || "");
     if (/no\s*sw/i.test(reasonText)) {
@@ -50,14 +154,16 @@ function ensureDeveloperDefaults() {
         "osesDeveloperMode",
         "osesRegularAutoAddPaused",
         "osesIrregularAutoAddPaused",
-        "osesGradeExtractionPaused"
+        "osesGradeExtractionPaused",
+        "osesOfferingsAutoRefreshEnabled"
     ], (result) => {
         const patch = {};
-        if (typeof result?.osesNewFeaturesEnabled !== "boolean") patch.osesNewFeaturesEnabled = false;
+        if (typeof result?.osesNewFeaturesEnabled !== "boolean") patch.osesNewFeaturesEnabled = true;
         if (typeof result?.osesDeveloperMode !== "boolean") patch.osesDeveloperMode = false;
         if (typeof result?.osesRegularAutoAddPaused !== "boolean") patch.osesRegularAutoAddPaused = false;
         if (typeof result?.osesIrregularAutoAddPaused !== "boolean") patch.osesIrregularAutoAddPaused = false;
         if (typeof result?.osesGradeExtractionPaused !== "boolean") patch.osesGradeExtractionPaused = false;
+        if (typeof result?.osesOfferingsAutoRefreshEnabled !== "boolean") patch.osesOfferingsAutoRefreshEnabled = true;
         if (Object.keys(patch).length > 0) {
             chrome.storage.local.set(patch);
         }
@@ -101,12 +207,18 @@ function normalizeIrregularEnrollmentRequest(raw) {
     const source = raw || {};
     const studentTypeRaw = String(source.studentType || source.tag || "").trim().toLowerCase();
     const isIrregular = source.isIrregular === true || studentTypeRaw === "irregular";
-    const queueRaw = Array.isArray(source.courses) ? source.courses : [];
+    const queueRaw = Array.isArray(source.courses)
+        ? source.courses
+        : Array.isArray(source.queue)
+            ? source.queue
+            : Array.isArray(source.sections)
+                ? source.sections
+                : [];
 
     const queue = queueRaw
         .map((item, index) => {
-            const courseCode = String(item?.courseCode || item?.code || "").trim().toUpperCase();
-            const section = String(item?.section || item?.classSection || "").trim().toUpperCase();
+            const courseCode = String(item?.courseCode || item?.code || item?.subjectCode || item?.subject || "").trim().toUpperCase();
+            const section = String(item?.section || item?.classSection || item?.sectionCode || item?.blockSection || "").trim().toUpperCase();
             if (!courseCode || !section) return null;
 
             return {
@@ -161,6 +273,7 @@ function persistIrregularEnrollmentRequest(raw) {
     const progress = buildIrregularProgress(normalized);
 
     chrome.storage.local.set({
+        osesNewFeaturesEnabled: true,
         osesBlockEnrollmentRequest: null,
         osesIrregularEnrollmentRequest: normalized,
         osesIrregularProgress: progress,
@@ -585,6 +698,16 @@ function isTrustedExternalSenderUrl(rawUrl) {
     return false;
 }
 
+function isTrustedExternalSender(sender) {
+    const senderUrl = String(sender?.url || "").trim();
+    if (isTrustedExternalSenderUrl(senderUrl)) return true;
+
+    const senderOrigin = String(sender?.origin || "").trim();
+    if (isTrustedExternalSenderUrl(senderOrigin)) return true;
+
+    return false;
+}
+
 function mergeAutomationStatus(previousStatus, incomingStatus) {
     const prev = previousStatus || {};
     const incoming = incomingStatus || {};
@@ -863,42 +986,41 @@ chrome.runtime.onMessage.addListener(function(request, sender, sendResponse) {
             return false;
         }
 
-        const targets = [
-            'http://localhost:3000/api/receive-course-data',
-            'https://compareng-tools.vercel.app/api/receive-course-data'
-        ];
+        const targets = COURSE_DATA_UPLOAD_TARGETS.dual.urls.slice();
 
-        const localTarget = targets[0];
+        const localTarget = targets.find((url) => /localhost|127\.0\.0\.1/i.test(url)) || targets[0];
         const fetchedContext = {
             term: String(courseData[0]?.term || "").trim(),
             schoolYear: String(courseData[0]?.schoolYear || "").trim(),
             updatedAt: Date.now()
         };
 
-        Promise.allSettled(targets.map(url => {
-            return fetch(url, {
-                method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json'
-                },
-                body: JSON.stringify(courseData)
-            }).then(response => {
-                if (!response.ok) {
-                    return response.text().then((bodyText) => {
-                        throw new Error(`HTTP ${response.status} from ${url}: ${bodyText || "No response body"}`);
-                    });
-                }
-                return response.json();
-            }).then(data => ({ url, data }))
-        }))
+        chrome.storage.local.set({
+            lastFetchedCourseContext: fetchedContext,
+            lastCourseUploadStatus: {
+                state: "posting",
+                message: `Uploading ${courseData.length} row(s)...`,
+                targetMode: "dual",
+                targets,
+                updatedAt: Date.now()
+            }
+        });
+
+        Promise.allSettled(targets.map((url) => postCourseDataWithLoopbackFallback(url, courseData)))
         .then(results => {
             const normalized = results.map((result, index) => {
                 const url = targets[index];
                 if (result.status === 'fulfilled') {
+                    const responseData = result.value?.data || null;
+                    const explicitSuccess = typeof responseData?.success === "boolean" ? responseData.success : true;
                     return {
                         url,
-                        ok: Boolean(result.value?.data?.success),
-                        response: result.value?.data || null,
+                        ok: explicitSuccess,
+                        response: {
+                            ...responseData,
+                            effectiveUrl: result.value?.effectiveUrl || url,
+                            usedFallback: result.value?.usedFallback === true
+                        },
                         error: null
                     };
                 }
@@ -915,23 +1037,49 @@ chrome.runtime.onMessage.addListener(function(request, sender, sendResponse) {
 
             const localResult = normalized.find(item => item.url === localTarget);
             if (localResult?.ok) {
-                chrome.storage.local.set({ lastFetchedCourseContext: fetchedContext });
+                chrome.storage.local.set({
+                    lastCourseUploadStatus: {
+                        state: "success",
+                        message: "Data sent successfully.",
+                        targetMode: "dual",
+                        targets: normalized,
+                        updatedAt: Date.now()
+                    }
+                });
                 sendResponse({ success: true, message: "Data sent to local API successfully.", targets: normalized });
                 return;
             }
 
             const firstSuccess = normalized.find(item => item.ok);
             if (firstSuccess) {
-                chrome.storage.local.set({ lastFetchedCourseContext: fetchedContext });
+                chrome.storage.local.set({
+                    lastCourseUploadStatus: {
+                        state: "success",
+                        message: `Data sent successfully to ${firstSuccess.url}.`,
+                        targetMode: "dual",
+                        targets: normalized,
+                        updatedAt: Date.now()
+                    }
+                });
                 sendResponse({ success: true, message: `Data sent successfully to ${firstSuccess.url}.`, targets: normalized });
                 return;
             }
 
             const localError = localResult?.error || localResult?.response?.error;
+            chrome.storage.local.set({
+                lastCourseUploadStatus: {
+                    state: "error",
+                    message: localError || "Failed to send data to all targets.",
+                    targetMode: "dual",
+                    targets: normalized,
+                    updatedAt: Date.now()
+                }
+            });
             sendResponse({
                 success: false,
                 message: localError || "Failed to send data to all targets.",
-                targets: normalized
+                targets: normalized,
+                targetMode: "dual"
             });
         });
 
@@ -949,10 +1097,11 @@ chrome.runtime.onMessageExternal.addListener((request, sender, sendResponse) => 
     ) return false;
 
     const senderUrl = String(sender?.url || "");
-    const trustedSender = isTrustedExternalSenderUrl(senderUrl);
+    const senderOrigin = String(sender?.origin || "");
+    const trustedSender = isTrustedExternalSender(sender);
 
     if (!trustedSender) {
-        sendResponse({ success: false, message: `Untrusted sender for enrollment request: ${senderUrl || "unknown"}` });
+        sendResponse({ success: false, message: `Untrusted sender for enrollment request: ${senderUrl || senderOrigin || "unknown"}` });
         return false;
     }
 

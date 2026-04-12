@@ -1,12 +1,11 @@
 {
     "manifest_version": 3,
     "name": "ComParEng Courses Data Extractor",
-    "version": "1.2.0",
+    "version": "1.1.0",
     "description": "Extracts course data from the student portal to the ComParEng's tools.",
 
     "host_permissions": [
       "http://localhost:3000/*",
-      "http://127.0.0.1:3000/*",
       "https://compareng-tools.vercel.app/*",
       "https://compareng-coursetracker.vercel.app/*",
       "https://solar.feutech.edu.ph/*",
@@ -15,9 +14,7 @@
 
     "permissions": [
       "storage",
-      "tabs",
-      "scripting",
-      "notifications"
+      "tabs"
     ],
 
     "content_scripts": [
@@ -33,19 +30,6 @@
           "content.js"
         ],
         "all_frames": true,
-        "run_at": "document_idle"
-      },
-      {
-        "matches": [
-          "http://localhost:3000/*",
-          "http://127.0.0.1/*",
-          "https://compareng-tools.vercel.app/*",
-          "https://compareng-coursetracker.vercel.app/*"
-        ],
-        "js": [
-          "webapp-bridge.js"
-        ],
-        "all_frames": false,
         "run_at": "document_idle"
       }
     ],

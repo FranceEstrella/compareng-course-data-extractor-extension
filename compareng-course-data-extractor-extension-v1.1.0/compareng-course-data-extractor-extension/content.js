@@ -1,9 +1,8 @@
-console.log("Content script loaded! [build 1.2.0-oses-login-m1]");
+console.log("Content script loaded! [build 1.1.0-oses-login-m1]");
 
 const currentPath = window.location.pathname;
 const isOfferingsPage = currentPath.startsWith("/course/offerings");
 const isRegistrationPage = currentPath.startsWith("/course/registration");
-const isGradesPage = currentPath.startsWith("/student/grades");
 const isTopWindow = window.top === window;
 const isOSESHost = window.location.hostname === "oses.feutech.edu.ph";
 
@@ -36,19 +35,6 @@ const loginAutomationState = {
   lastClickedAt: 0
 };
 
-const gradeExtractionState = {
-  inFlight: false,
-  lastRunId: "",
-  autoRunTried: false
-};
-
-const offeringsExtractionState = {
-  inFlight: false,
-  autoRunTried: false,
-  lastSentSignature: "",
-  refreshScheduled: false
-};
-
 function hasUsableExtensionContext() {
   try {
     return Boolean(chrome?.runtime?.id);
@@ -60,20 +46,18 @@ function hasUsableExtensionContext() {
 function safeSendRuntimeMessage(payload, callback) {
   if (!hasUsableExtensionContext()) return false;
   try {
-    chrome.runtime.sendMessage(payload, (response) => {
-      const runtimeError = chrome.runtime.lastError;
-      if (runtimeError) {
-        // "No SW" can happen briefly while MV3 service worker spins up or reloads.
-        if (typeof callback === "function") {
+    if (typeof callback === "function") {
+      chrome.runtime.sendMessage(payload, (response) => {
+        const runtimeError = chrome.runtime.lastError;
+        if (runtimeError) {
           callback({ success: false, message: runtimeError.message, runtimeError: true });
+          return;
         }
-        return;
-      }
-
-      if (typeof callback === "function") {
         callback(response);
-      }
-    });
+      });
+    } else {
+      chrome.runtime.sendMessage(payload);
+    }
     return true;
   } catch {
     return false;
@@ -140,45 +124,8 @@ async function isIrregularAutomationPaused() {
   return store?.osesIrregularAutoAddPaused === true;
 }
 
-async function areNewFeaturesEnabled() {
-  const store = await readStorage(["osesNewFeaturesEnabled"]);
-  return store?.osesNewFeaturesEnabled === true;
-}
-
-async function isOfferingsAutoRefreshEnabled() {
-  const store = await readStorage(["osesOfferingsAutoRefreshEnabled"]);
-  return store?.osesOfferingsAutoRefreshEnabled === true;
-}
-
-function scheduleOfferingsAutoRefresh() {
-  if (!isOfferingsPage || !isTopWindow) return;
-  if (offeringsExtractionState.refreshScheduled) return;
-  offeringsExtractionState.refreshScheduled = true;
-  const nextRefreshAt = Date.now() + 15000;
-  safeStorageSet({
-    osesOfferingsAutoRefreshStatus: {
-      state: "scheduled",
-      nextRefreshAt,
-      scheduledAt: Date.now(),
-      intervalMs: 15000
-    }
-  });
-  setTimeout(() => {
-    safeStorageSet({
-      osesOfferingsAutoRefreshStatus: {
-        state: "refreshing",
-        nextRefreshAt: 0,
-        scheduledAt: Date.now(),
-        intervalMs: 15000
-      }
-    });
-    window.location.reload();
-  }, 15000);
-}
-
 async function runOSESAutomation() {
   if (!isTopWindow || !isRegistrationPage) return;
-  if (!(await areNewFeaturesEnabled())) return;
 
   const monitor = window.OSESIFrameMonitor;
 
@@ -310,10 +257,9 @@ function findOSESLoginButton(root) {
   }) || null;
 }
 
-async function runAutoLoginClick() {
+function runAutoLoginClick() {
   if (!isLikelyOSESLoginContext()) return;
   if (loginAutomationState.inFlight) return;
-  if (!(await areNewFeaturesEnabled())) return;
 
   loginAutomationState.inFlight = true;
   try {
@@ -460,7 +406,6 @@ async function clickConfirmationOkIfVisible(desiredBlock) {
 async function runBlockConfirmationAutomation() {
   if (!isConfirmationAutomationContext()) return;
   if (confirmationAutomationState.inFlight) return;
-  if (!(await areNewFeaturesEnabled())) return;
 
   confirmationAutomationState.inFlight = true;
   try {
@@ -569,7 +514,6 @@ async function clickRegisterBlockButton(blockDoc, desiredBlock) {
 async function runRegularBlockEnrollment() {
   if (!isInsideOSESMainEnrollmentPage()) return;
   if (blockAutomationState.inFlight) return;
-  if (!(await areNewFeaturesEnabled())) return;
 
   if (await isRegularAutomationPaused()) {
     if (!regularAutomationState.pauseNotified) {
@@ -1040,7 +984,6 @@ async function saveIrregularProgressPatch(patch) {
 async function runIrregularEnrollment() {
   if (isTopWindow) return;
   if (irregularAutomationState.inFlight) return;
-  if (!(await areNewFeaturesEnabled())) return;
 
   if (await isIrregularAutomationPaused()) {
     postOSESStatus("irregular_paused", "Irregular auto-add is paused. Press Start in popup to continue.", {
@@ -1551,36 +1494,14 @@ function extractCourseData() {
     console.warn(`Could not fully detect term/school year from dropdowns. term="${term}", schoolYear="${schoolYear}"`);
   }
 
-  const tableSelectors = [
-    "#courseOfferingsTable",
-    "table[id*='course'][id*='offer']",
-    "table[id*='offerings']",
-    "table"
-  ];
-
-  let resolvedRows = [];
-  for (const selector of tableSelectors) {
-    const candidateTables = Array.from(document.querySelectorAll(selector));
-    for (const table of candidateTables) {
-      const bodyRows = Array.from(table.querySelectorAll("tbody tr"));
-      const rows = bodyRows.length ? bodyRows : Array.from(table.querySelectorAll("tr"));
-      const dataLikeRows = rows.filter((row) => row.querySelectorAll("td").length >= 7);
-      if (dataLikeRows.length > 0) {
-        resolvedRows = rows;
-        break;
-      }
-    }
-    if (resolvedRows.length > 0) break;
-  }
-
-  const courseRows = resolvedRows;
+  const courseRows = document.querySelectorAll('#courseOfferingsTable tr'); // Select all rows in the table
   const totalRows = courseRows.length;
 
   console.log(`Starting to read ${totalRows} course rows...`);
 
   const courses = [];
 
-  for (let i = 0; i < totalRows; i++) {
+  for (let i = 1; i < totalRows; i++) { // Start from the second row to skip the header
     const row = courseRows[i];
     const cells = row.querySelectorAll('td');
 
@@ -1594,8 +1515,7 @@ function extractCourseData() {
       const meetingDays = cells[4]?.textContent?.trim();
       const meetingTime = cells[5]?.textContent?.trim();
       const room = cells[6]?.textContent?.trim();
-      const slotsValue = parseInt(String(remainingSlots || "0"), 10);
-      const hasSlots = !row.classList.contains('out-of-stock') && Number.isFinite(slotsValue) && slotsValue > 0;
+      const hasSlots = !row.classList.contains('out-of-stock') && parseInt(remainingSlots) > 0;
 
       if (courseCode && section) {
         courses.push({
@@ -1620,79 +1540,10 @@ function extractCourseData() {
   return courses;
 }
 
-async function runOfferingsExtraction(reason = "auto") {
-  if (!isOfferingsPage || !isTopWindow) return { success: false, message: "Not on offerings page." };
-  if (offeringsExtractionState.inFlight) return { success: false, message: "Extraction already running." };
-
-  offeringsExtractionState.inFlight = true;
-  try {
-    const extractedCourses = extractCourseData();
-    if (!Array.isArray(extractedCourses) || extractedCourses.length === 0) {
-      return { success: false, message: "No course rows detected yet." };
-    }
-
-    const signature = `${extractedCourses.length}|${extractedCourses[0]?.term || ""}|${extractedCourses[0]?.schoolYear || ""}|${extractedCourses[0]?.courseCode || ""}`;
-    if (signature === offeringsExtractionState.lastSentSignature) {
-      return { success: true, skipped: true, message: "No change from last extracted payload.", count: extractedCourses.length };
-    }
-
-    console.log("Extracted Courses:", extractedCourses);
-    const dispatched = safeSendRuntimeMessage({ action: "courseDataExtracted", data: extractedCourses, reason }, async (response) => {
-      if (response?.success) {
-        offeringsExtractionState.lastSentSignature = signature;
-        if (await isOfferingsAutoRefreshEnabled()) {
-          scheduleOfferingsAutoRefresh();
-        } else {
-          safeStorageSet({
-            osesOfferingsAutoRefreshStatus: {
-              state: "disabled",
-              nextRefreshAt: 0,
-              scheduledAt: Date.now(),
-              intervalMs: 15000
-            }
-          });
-        }
-      }
-    });
-
-    if (!dispatched) {
-      return { success: false, message: "Unable to send extracted payload to extension runtime." };
-    }
-
-    return { success: true, count: extractedCourses.length };
-  } finally {
-    offeringsExtractionState.inFlight = false;
-  }
-}
-
-async function maybeAutoRunOfferingsExtraction() {
-  if (!isOfferingsPage || !isTopWindow) return;
-  if (offeringsExtractionState.autoRunTried) return;
-  offeringsExtractionState.autoRunTried = true;
-
-  for (let attempt = 0; attempt < 10; attempt += 1) {
-    const result = await runOfferingsExtraction(`auto-attempt-${attempt + 1}`);
-    if (result?.success && !result?.skipped) {
-      return;
-    }
-    await sleep(800);
-  }
-
-  const observer = new MutationObserver(async () => {
-    const result = await runOfferingsExtraction("observer-retry");
-    if (result?.success && !result?.skipped) {
-      observer.disconnect();
-    }
-  });
-
-  if (document.documentElement) {
-    observer.observe(document.documentElement, { childList: true, subtree: true });
-    setTimeout(() => observer.disconnect(), 60000);
-  }
-}
-
-if (isOfferingsPage && isTopWindow) {
-  maybeAutoRunOfferingsExtraction();
+if (isOfferingsPage) {
+  const extractedCourses = extractCourseData();
+  console.log("Extracted Courses:", extractedCourses);
+  safeSendRuntimeMessage({ action: "courseDataExtracted", data: extractedCourses });
 }
 
 if (isRegistrationPage) {
@@ -1782,856 +1633,4 @@ function appendUniqueCourseSection(list, item) {
   if (!key || key === "__") return;
   const exists = list.some((entry) => courseSectionKey(entry.courseCode, entry.section) === key);
   if (!exists) list.push(item);
-}
-
-function getGradeExtractionStatusSummary(stage, extra = {}) {
-  return {
-    stage,
-    status: stage,
-    updatedAt: Date.now(),
-    ...extra
-  };
-}
-
-function postGradeExtractionStatus(stage, extra = {}) {
-  safeSendRuntimeMessage({
-    action: "osesGradeExtractionStatus",
-    data: getGradeExtractionStatusSummary(stage, extra)
-  });
-}
-
-async function isGradeExtractionPaused() {
-  const store = await readStorage(["osesGradeExtractionPaused"]);
-  return store?.osesGradeExtractionPaused === true;
-}
-
-function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-function getTextContent(el) {
-  return String(el?.textContent || "").replace(/\s+/g, " ").trim();
-}
-
-function normalizeCourseCode(raw) {
-  return String(raw || "").trim().toUpperCase().replace(/\s+/g, " ");
-}
-
-function isLikelyCourseCode(value) {
-  const code = String(value || "").trim().toUpperCase();
-  if (!code) return false;
-  // Accept mixed curriculum-style codes and avoid dropping potential unmatched courses.
-  return /[A-Z]/.test(code) && code.length >= 3;
-}
-
-function pickGradeTableRows() {
-  const tables = Array.from(document.querySelectorAll("table"));
-  for (const table of tables) {
-    const headerCells = Array.from(table.querySelectorAll("thead th, tr th, tr:first-child td")).map((cell) => getTextContent(cell).toLowerCase());
-    const hasCourseColumn = headerCells.some((h) => /course|subject|code/.test(h));
-    const hasGradeColumn = headerCells.some((h) => /final\s*grade|\bfinal\b|\bgrade\b/.test(h));
-    if (!hasCourseColumn || !hasGradeColumn) continue;
-
-    const rows = Array.from(table.querySelectorAll("tbody tr, tr")).filter((row) => row.querySelectorAll("td").length >= 2);
-    if (rows.length > 0) return { table, rows, headerCells };
-  }
-  return { table: null, rows: [], headerCells: [] };
-}
-
-function findColumnIndexes(headerCells) {
-  let courseIndex = -1;
-  let gradeIndex = -1;
-  let finalIndex = -1;
-
-  headerCells.forEach((header, index) => {
-    const h = String(header || "").toLowerCase();
-    if (courseIndex < 0 && /course\s*code|subject\s*code|course|subject|code/.test(h)) {
-      courseIndex = index;
-    }
-    if (finalIndex < 0 && /\bfinal\b/.test(h)) {
-      finalIndex = index;
-    }
-    if (gradeIndex < 0 && /final\s*grade|grade/.test(h)) {
-      gradeIndex = index;
-    }
-  });
-
-  if (courseIndex < 0) courseIndex = 0;
-  if (finalIndex >= 0) {
-    gradeIndex = finalIndex;
-  }
-  if (gradeIndex < 0) gradeIndex = 1;
-
-  return { courseIndex, gradeIndex };
-}
-
-function isIgnorableGrade(grade) {
-  const value = String(grade || "").trim().toLowerCase();
-  if (!value) return true;
-  return value === "--" || value === "n/a" || value === "na" || value === "inc";
-}
-
-function getTermOrder(termLabel) {
-  const normalized = normalizeTerm(termLabel || "");
-  if (normalized === "Term 1") return 1;
-  if (normalized === "Term 2") return 2;
-  if (normalized === "Term 3") return 3;
-  return 99;
-}
-
-function getSchoolYearStart(value) {
-  const text = String(value || "").trim();
-  const standard = text.match(/(20\d{2})\s*[-/]\s*(20\d{2})/);
-  if (standard) return Number.parseInt(standard[1], 10);
-
-  const compact = text.match(/(20\d{2})(20\d{2})/);
-  if (compact) return Number.parseInt(compact[1], 10);
-
-  return NaN;
-}
-
-function sortGradeTermOptionsChronologically(options) {
-  return [...options].sort((a, b) => {
-    const aText = getTextContent(a);
-    const bText = getTextContent(b);
-
-    const aYear = getSchoolYearStart(aText);
-    const bYear = getSchoolYearStart(bText);
-    const aHasYear = Number.isFinite(aYear);
-    const bHasYear = Number.isFinite(bYear);
-
-    if (aHasYear && bHasYear && aYear !== bYear) {
-      return aYear - bYear;
-    }
-
-    const aTerm = getTermOrder(aText);
-    const bTerm = getTermOrder(bText);
-    if (aTerm !== bTerm) {
-      return aTerm - bTerm;
-    }
-
-    const aIndex = Number(a.index ?? 0);
-    const bIndex = Number(b.index ?? 0);
-    return aIndex - bIndex;
-  });
-}
-
-function readSchoolYearFromPage() {
-  const year = findSchoolYearValue();
-  if (year) return year;
-  const textMatch = getTextContent(document.body).match(/20\d{2}\s*[-/]\s*20\d{2}/);
-  return textMatch ? normalizeSchoolYear(textMatch[0]) : "";
-}
-
-function findGradesTermSelect() {
-  const selects = Array.from(document.querySelectorAll("select"));
-  const preferred = selects.find((selectEl) => {
-    const context = getSelectContext(selectEl).toLowerCase();
-    const options = Array.from(selectEl.options || []);
-    return /term|semester/.test(context) && options.length > 1;
-  });
-  if (preferred) return preferred;
-
-  return selects.find((selectEl) => {
-    const options = Array.from(selectEl.options || []).map((option) => getTextContent(option).toLowerCase());
-    const hits = options.filter((t) => /term|semester|1st|2nd|3rd|summer/.test(t));
-    return hits.length >= 2;
-  }) || null;
-}
-
-function findGradesSchoolYearSelect() {
-  const selects = Array.from(document.querySelectorAll("select"));
-  const preferred = selects.find((selectEl) => {
-    const context = getSelectContext(selectEl).toLowerCase();
-    const options = Array.from(selectEl.options || []);
-    const hasSchoolYearHint = /school\s*year|academic\s*year|\bsy\b/.test(context);
-    return hasSchoolYearHint && options.length > 1;
-  });
-  if (preferred) return preferred;
-
-  return selects.find((selectEl) => {
-    const options = Array.from(selectEl.options || []).map((option) => getTextContent(option));
-    const yearHits = options.filter((text) => Number.isFinite(getSchoolYearStart(text)));
-    return yearHits.length >= 2;
-  }) || null;
-}
-
-function isCombinedTermSchoolYearSelect(selectEl) {
-  if (!selectEl) return false;
-  const context = getSelectContext(selectEl).toLowerCase();
-  if (context.includes("term") && context.includes("school year")) return true;
-
-  const options = Array.from(selectEl.options || []).map((option) => getTextContent(option));
-  return options.some((text) => /^\s*[123]\s*[-/]\s*20\d{4}\s*$/i.test(text) || /^\s*[123]\s*[-/]\s*20\d{2}\s*[-/]\s*20\d{2}\s*$/i.test(text));
-}
-
-function parseTermSchoolYearLabel(label) {
-  const raw = String(label || "").trim();
-  if (!raw) {
-    return {
-      term: "",
-      schoolYear: ""
-    };
-  }
-
-  const termMatch = raw.match(/^\s*([123])\b/);
-  let term = "";
-  if (termMatch?.[1] === "1") term = "Term 1";
-  if (termMatch?.[1] === "2") term = "Term 2";
-  if (termMatch?.[1] === "3") term = "Term 3";
-
-  const yearMatch = raw.match(/(20\d{2}\s*[-/]\s*20\d{2}|20\d{2}20\d{2}|20\d{4})/);
-  const schoolYear = yearMatch ? normalizeSchoolYear(yearMatch[1]) : "";
-
-  return {
-    term,
-    schoolYear
-  };
-}
-
-function toOptionSnapshot(option) {
-  return {
-    value: String(option?.value || ""),
-    text: getTextContent(option),
-    index: Number(option?.index ?? 0)
-  };
-}
-
-function findOptionBySnapshot(selectEl, snapshot) {
-  if (!selectEl || !snapshot) return null;
-  const options = Array.from(selectEl.options || []);
-  if (!options.length) return null;
-
-  const desiredText = String(snapshot.text || "").trim().toLowerCase();
-  const desiredIndex = Number(snapshot.index ?? -1);
-
-  // Prefer text+index first so we do not get stuck when portals reuse option values.
-  if (desiredText && Number.isFinite(desiredIndex) && desiredIndex >= 0) {
-    const byTextAndIndex = options.find((option) => {
-      return Number(option.index ?? -1) === desiredIndex && getTextContent(option).toLowerCase() === desiredText;
-    });
-    if (byTextAndIndex) return byTextAndIndex;
-  }
-
-  // Next, use index if it is valid for this refreshed select.
-  if (Number.isFinite(desiredIndex) && desiredIndex >= 0 && desiredIndex < options.length) {
-    return options[desiredIndex];
-  }
-
-  // Fallback to exact text matching.
-  if (desiredText) {
-    const byText = options.find((option) => getTextContent(option).toLowerCase() === desiredText);
-    if (byText) return byText;
-
-    const byTextContains = options.find((option) => getTextContent(option).toLowerCase().includes(desiredText));
-    if (byTextContains) return byTextContains;
-  }
-
-  // Value is least reliable on this portal because it can be duplicated across options.
-  const snapshotValue = String(snapshot.value || "");
-  if (snapshotValue) {
-    const byValue = options.find((option) => String(option.value || "") === snapshotValue);
-    if (byValue) return byValue;
-  }
-
-  return null;
-}
-
-function dispatchSelectChange(selectEl, optionEl) {
-  if (!selectEl || !optionEl) return false;
-  selectEl.value = optionEl.value;
-  if (typeof optionEl.index === "number") {
-    selectEl.selectedIndex = optionEl.index;
-  }
-  selectEl.dispatchEvent(new Event("input", { bubbles: true }));
-  selectEl.dispatchEvent(new Event("change", { bubbles: true }));
-  return true;
-}
-
-function sortSchoolYearOptionsChronologically(options) {
-  return [...options].sort((a, b) => {
-    const aText = getTextContent(a);
-    const bText = getTextContent(b);
-    const aYear = getSchoolYearStart(aText);
-    const bYear = getSchoolYearStart(bText);
-    const aHasYear = Number.isFinite(aYear);
-    const bHasYear = Number.isFinite(bYear);
-
-    if (aHasYear && bHasYear && aYear !== bYear) {
-      return aYear - bYear;
-    }
-
-    const aIndex = Number(a.index ?? 0);
-    const bIndex = Number(b.index ?? 0);
-    return aIndex - bIndex;
-  });
-}
-
-function sortOptionsBottomFirst(options) {
-  return [...options].sort((a, b) => Number(b?.index ?? 0) - Number(a?.index ?? 0));
-}
-
-function doesSelectionLookApplied(expectedTermLabel, expectedSchoolYear) {
-  const expectedTerm = normalizeTerm(expectedTermLabel || "");
-  const currentTerm = normalizeTerm(findTermValue() || "");
-  if (expectedTerm && currentTerm && expectedTerm !== currentTerm) {
-    return false;
-  }
-
-  const expectedYearStart = getSchoolYearStart(expectedSchoolYear || "");
-  const currentYearStart = getSchoolYearStart(readSchoolYearFromPage() || "");
-  if (Number.isFinite(expectedYearStart) && Number.isFinite(currentYearStart) && expectedYearStart !== currentYearStart) {
-    return false;
-  }
-
-  return true;
-}
-
-function getSelectableOptions(selectEl) {
-  if (!selectEl) return [];
-  return Array.from(selectEl.options || []).filter((option) => String(option.value || "").trim());
-}
-
-function getOptionByReversePosition(selectEl, reversePosition) {
-  const options = getSelectableOptions(selectEl);
-  if (!options.length) return null;
-  const idx = options.length - 1 - Number(reversePosition || 0);
-  if (idx < 0 || idx >= options.length) return null;
-  return options[idx];
-}
-
-function findGradesSubmitButton(anchorEl) {
-  const selector = "button, input[type='button'], input[type='submit'], a";
-  const candidates = [];
-
-  const form = anchorEl?.closest?.("form");
-  if (form) {
-    candidates.push(...Array.from(form.querySelectorAll(selector)));
-  }
-
-  const controlsContainer = anchorEl?.closest?.(".x-panel, .x-form, .x-form-item, .toolbar, .filters, .filter, .search");
-  if (controlsContainer) {
-    candidates.push(...Array.from(controlsContainer.querySelectorAll(selector)));
-  }
-
-  if (!candidates.length) {
-    candidates.push(...Array.from(document.querySelectorAll(selector)));
-  }
-
-  const seen = new Set();
-  const uniqueCandidates = candidates.filter((el) => {
-    if (seen.has(el)) return false;
-    seen.add(el);
-    return true;
-  });
-
-  return uniqueCandidates.find((el) => {
-    if (!isElementVisible(el)) return false;
-
-    const text = String(el.textContent || el.value || el.getAttribute("title") || "").trim().toLowerCase();
-    if (!text) return false;
-
-    if (/log\s*out|logout|sign\s*out|signout|exit/.test(text)) return false;
-
-    return /\bsubmit\b|\bfilter\b|\bsearch\b|\bview\b|\bshow\b|\bgo\b/.test(text);
-  }) || null;
-}
-
-async function applyGradesFilters({ schoolYearSnapshot = null, termSnapshot = null, schoolYearReverseOffset = null, termReverseOffset = null } = {}) {
-  const schoolYearSelect = findGradesSchoolYearSelect();
-  const termSelect = findGradesTermSelect();
-
-  if (schoolYearSelect) {
-    const yearOption = Number.isInteger(schoolYearReverseOffset)
-      ? getOptionByReversePosition(schoolYearSelect, schoolYearReverseOffset)
-      : (schoolYearSnapshot ? findOptionBySnapshot(schoolYearSelect, schoolYearSnapshot) : null);
-    if (yearOption) {
-      dispatchSelectChange(schoolYearSelect, yearOption);
-    }
-  }
-
-  if (termSelect) {
-    const termOption = Number.isInteger(termReverseOffset)
-      ? getOptionByReversePosition(termSelect, termReverseOffset)
-      : (termSnapshot ? findOptionBySnapshot(termSelect, termSnapshot) : null);
-    if (termOption) {
-      dispatchSelectChange(termSelect, termOption);
-    }
-  }
-
-  const submit = findGradesSubmitButton(termSelect || schoolYearSelect);
-  if (submit) {
-    clickElementBestEffort(submit);
-  }
-
-  await sleep(1500);
-}
-
-const GRADE_COMBINED_SESSION_KEY = "osesGradeExtractionCombinedSession";
-
-async function getGradeCombinedSession() {
-  const store = await readStorage([GRADE_COMBINED_SESSION_KEY]);
-  return store?.[GRADE_COMBINED_SESSION_KEY] || null;
-}
-
-function setGradeCombinedSession(session) {
-  safeStorageSet({ [GRADE_COMBINED_SESSION_KEY]: session });
-}
-
-function clearGradeCombinedSession() {
-  safeStorageRemove([GRADE_COMBINED_SESSION_KEY]);
-}
-
-function makeOptionKey(snapshot) {
-  if (!snapshot) return "";
-  const value = String(snapshot.value || "").trim();
-  const text = String(snapshot.text || "").trim().toLowerCase();
-  return `${value}::${text}`;
-}
-
-function isGradesAccessBlockedByBalance() {
-  const pageText = getTextContent(document.body).toLowerCase();
-  if (!pageText) return false;
-
-  return (
-    pageText.includes("grades currently inaccessible") ||
-    pageText.includes("grade report currently inaccessible") ||
-    (pageText.includes("inaccessible") && pageText.includes("account balance")) ||
-    (pageText.includes("cannot") && pageText.includes("grade") && pageText.includes("account balance"))
-  );
-}
-
-async function extractGradeAttemptsFromPage(runId, trigger = "manual") {
-  const attempts = [];
-  let chronology = 0;
-
-  const collectCurrentGridRows = (portalTermLabelHint = "", schoolYearHint = "") => {
-    const portalTermLabel = portalTermLabelHint || findTermValue() || "Unknown Term";
-    const parsedLabel = parseTermSchoolYearLabel(portalTermLabel);
-    const schoolYear = parsedLabel.schoolYear || schoolYearHint || readSchoolYearFromPage();
-    const term = parsedLabel.term || normalizeTerm(portalTermLabel || findTermValue() || "");
-
-    const { rows, headerCells } = pickGradeTableRows();
-    const { courseIndex, gradeIndex } = findColumnIndexes(headerCells);
-
-    const parsed = [];
-
-    rows.forEach((row) => {
-      const cells = Array.from(row.querySelectorAll("td"));
-      if (!cells.length) return;
-
-      const courseCode = normalizeCourseCode(getTextContent(cells[courseIndex] || cells[0]));
-      const finalGrade = getTextContent(cells[gradeIndex] || cells[cells.length - 1]);
-      if (!courseCode || isIgnorableGrade(finalGrade)) return;
-      if (!isLikelyCourseCode(courseCode)) return;
-
-      parsed.push({
-        courseCode,
-        finalGrade,
-        schoolYear,
-        portalTermLabel,
-        term
-      });
-    });
-
-    return parsed;
-  };
-
-  const waitUntilGradesAreReadable = async (
-    portalTermLabelHint = "",
-    schoolYearHint = "",
-    selection = { schoolYearSnapshot: null, termSnapshot: null, schoolYearReverseOffset: null, termReverseOffset: null }
-  ) => {
-    const maxAttempts = 40;
-
-    for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
-      const portalTermLabel = portalTermLabelHint || findTermValue() || "Unknown Term";
-
-      postGradeExtractionStatus("running", {
-        currentTermLabel: portalTermLabel,
-        extractedCount: attempts.length,
-        message: `Waiting for grades (${attempt}/${maxAttempts})`
-      });
-
-      if (!doesSelectionLookApplied(portalTermLabelHint, schoolYearHint)) {
-        // Portal sometimes resets filters after submit; force the expected selection again.
-        await applyGradesFilters({
-          schoolYearSnapshot: selection?.schoolYearSnapshot || null,
-          termSnapshot: selection?.termSnapshot || null,
-          schoolYearReverseOffset: Number.isInteger(selection?.schoolYearReverseOffset) ? selection.schoolYearReverseOffset : null,
-          termReverseOffset: Number.isInteger(selection?.termReverseOffset) ? selection.termReverseOffset : null
-        });
-        await sleep(900);
-        continue;
-      }
-
-      const parsedRows = collectCurrentGridRows(portalTermLabelHint, schoolYearHint);
-      if (parsedRows.length > 0) {
-        parsedRows.forEach((entry) => {
-          attempts.push({
-            ...entry,
-            chronologicalIndex: chronology
-          });
-          chronology += 1;
-        });
-
-        postGradeExtractionStatus("running", {
-          currentTermLabel: portalTermLabel,
-          extractedCount: attempts.length,
-          message: `Read ${parsedRows.length} grade row(s) for ${portalTermLabel}.`
-        });
-        return parsedRows.length;
-      }
-
-      await sleep(900);
-    }
-
-    throw new Error(`Timed out waiting for grades to load for ${portalTermLabelHint || "selected term"}.`);
-  };
-
-  const initialYearSelect = findGradesSchoolYearSelect();
-  const initialTermSelect = findGradesTermSelect();
-  const singleCombinedSelect = Boolean(initialTermSelect && isCombinedTermSchoolYearSelect(initialTermSelect));
-
-  if (singleCombinedSelect) {
-    const liveCombinedSelect = findGradesTermSelect();
-    const allOptions = sortOptionsBottomFirst(getSelectableOptions(liveCombinedSelect)).map(toOptionSnapshot);
-    if (!allOptions.length) {
-      throw new Error("No term-school-year options found in dropdown.");
-    }
-
-    const selectedOption = liveCombinedSelect?.options?.[liveCombinedSelect.selectedIndex] || null;
-    const selectedSnapshot = selectedOption ? toOptionSnapshot(selectedOption) : allOptions[0];
-    const selectedKey = makeOptionKey(selectedSnapshot);
-
-    let session = await getGradeCombinedSession();
-    const shouldStartFresh = trigger !== "auto-on-open" || !session || session?.runId !== runId;
-
-    if (shouldStartFresh) {
-      session = {
-        runId,
-        queue: allOptions,
-        processedKeys: [],
-        attempts: [],
-        updatedAt: Date.now()
-      };
-    }
-
-    const processedKeys = Array.isArray(session.processedKeys) ? session.processedKeys : [];
-    const sessionAttempts = Array.isArray(session.attempts) ? session.attempts : [];
-    const queue = Array.isArray(session.queue) ? session.queue : allOptions;
-
-    const parseCurrent = parseTermSchoolYearLabel(selectedSnapshot?.text || "");
-    const parsedRows = collectCurrentGridRows(
-      parseCurrent.term || selectedSnapshot?.text || findTermValue() || "Unknown Term",
-      parseCurrent.schoolYear || readSchoolYearFromPage()
-    );
-
-    if (!processedKeys.includes(selectedKey) && parsedRows.length > 0) {
-      parsedRows.forEach((entry, idx) => {
-        sessionAttempts.push({
-          ...entry,
-          chronologicalIndex: sessionAttempts.length + idx
-        });
-      });
-      processedKeys.push(selectedKey);
-    }
-
-    const remaining = queue.filter((item) => !processedKeys.includes(makeOptionKey(item)));
-    const blockedByBalance = isGradesAccessBlockedByBalance();
-    const shouldStopBecauseLatestIsBlocked = blockedByBalance && parsedRows.length === 0;
-
-    postGradeExtractionStatus("running", {
-      runId,
-      currentTermLabel: selectedSnapshot?.text || findTermValue() || "Unknown Term",
-      extractedCount: sessionAttempts.length,
-      stoppedAt: "",
-      message: shouldStopBecauseLatestIsBlocked
-        ? "Stopping at latest term: grades inaccessible due to account balance."
-        : (remaining.length ? `Processed current selection. Remaining: ${remaining.length}` : "All selections processed.")
-    });
-
-    if (shouldStopBecauseLatestIsBlocked) {
-      clearGradeCombinedSession();
-      return {
-        completedAttempts: sessionAttempts,
-        stoppedAt: "Latest term inaccessible due to account balance"
-      };
-    }
-
-    if (!remaining.length) {
-      clearGradeCombinedSession();
-      return sessionAttempts;
-    }
-
-    const nextSnapshot = remaining[0];
-    setGradeCombinedSession({
-      runId,
-      queue: queue,
-      processedKeys,
-      attempts: sessionAttempts,
-      updatedAt: Date.now()
-    });
-
-    await applyGradesFilters({
-      schoolYearSnapshot: null,
-      termSnapshot: nextSnapshot,
-      schoolYearReverseOffset: null,
-      termReverseOffset: null
-    });
-
-    return { pending: true, runId, extractedCount: sessionAttempts.length };
-  } else {
-
-  const initialYearCount = getSelectableOptions(initialYearSelect).length;
-
-  if (initialYearCount > 0) {
-    for (let yearOffset = 0; yearOffset < initialYearCount; yearOffset += 1) {
-      const liveYearSelect = findGradesSchoolYearSelect();
-      const liveYearOption = getOptionByReversePosition(liveYearSelect, yearOffset);
-      const yearSnapshot = liveYearOption ? toOptionSnapshot(liveYearOption) : null;
-
-      if (yearSnapshot) {
-        await applyGradesFilters({
-          schoolYearSnapshot: yearSnapshot,
-          termSnapshot: null,
-          schoolYearReverseOffset: yearOffset,
-          termReverseOffset: null
-        });
-      }
-
-      const termSelectForYear = findGradesTermSelect();
-      const termCountForYear = getSelectableOptions(termSelectForYear).length;
-
-      if (!termCountForYear) {
-        await waitUntilGradesAreReadable(
-          findTermValue() || "Unknown Term",
-          yearSnapshot?.text || readSchoolYearFromPage(),
-          {
-            schoolYearSnapshot: yearSnapshot,
-            termSnapshot: null,
-            schoolYearReverseOffset: yearOffset,
-            termReverseOffset: null
-          }
-        );
-        continue;
-      }
-
-      for (let termOffset = 0; termOffset < termCountForYear; termOffset += 1) {
-        const freshYearSelect = findGradesSchoolYearSelect();
-        const freshYearOption = getOptionByReversePosition(freshYearSelect, yearOffset);
-        const freshYearSnapshot = freshYearOption ? toOptionSnapshot(freshYearOption) : yearSnapshot;
-
-        const freshTermSelect = findGradesTermSelect();
-        const freshTermOption = getOptionByReversePosition(freshTermSelect, termOffset);
-        const termSnapshot = freshTermOption ? toOptionSnapshot(freshTermOption) : null;
-
-        await applyGradesFilters({
-          schoolYearSnapshot: freshYearSnapshot,
-          termSnapshot,
-          schoolYearReverseOffset: yearOffset,
-          termReverseOffset: termOffset
-        });
-
-        await waitUntilGradesAreReadable(
-          termSnapshot?.text || findTermValue() || "Unknown Term",
-          freshYearSnapshot?.text || readSchoolYearFromPage(),
-          {
-            schoolYearSnapshot: freshYearSnapshot,
-            termSnapshot,
-            schoolYearReverseOffset: yearOffset,
-            termReverseOffset: termOffset
-          }
-        );
-      }
-    }
-  } else {
-    const initialTermCount = getSelectableOptions(initialTermSelect).length;
-
-    if (!initialTermCount) {
-      await waitUntilGradesAreReadable(findTermValue() || "Unknown Term", readSchoolYearFromPage(), {
-        schoolYearSnapshot: null,
-        termSnapshot: null
-      });
-    } else {
-      for (let termOffset = 0; termOffset < initialTermCount; termOffset += 1) {
-        const freshTermSelect = findGradesTermSelect();
-        const freshTermOption = getOptionByReversePosition(freshTermSelect, termOffset);
-        const termSnapshot = freshTermOption ? toOptionSnapshot(freshTermOption) : null;
-
-        if (termSnapshot) {
-          await applyGradesFilters({
-            termSnapshot,
-            schoolYearReverseOffset: null,
-            termReverseOffset: termOffset
-          });
-        }
-
-        await waitUntilGradesAreReadable(
-          termSnapshot?.text || findTermValue() || "Unknown Term",
-          readSchoolYearFromPage(),
-          {
-            schoolYearSnapshot: null,
-            termSnapshot,
-            schoolYearReverseOffset: null,
-            termReverseOffset: termOffset
-          }
-        );
-      }
-    }
-  }
-  }
-
-  const deduped = [];
-  const seen = new Set();
-  attempts.forEach((item) => {
-    const key = `${item.courseCode}__${item.schoolYear}__${item.portalTermLabel}__${item.finalGrade}`;
-    if (seen.has(key)) return;
-    seen.add(key);
-    deduped.push(item);
-  });
-
-  return deduped;
-}
-
-async function runGradeExtractionAutomation(trigger = "manual") {
-  if (!isTopWindow || !isGradesPage) return { success: false, message: "Not on Student Grades page." };
-  if (gradeExtractionState.inFlight) return { success: true, message: "Grade extraction already running." };
-  if (!(await areNewFeaturesEnabled())) return { success: false, message: "New Features are disabled in extension popup." };
-
-  if (await isGradeExtractionPaused()) {
-    postGradeExtractionStatus("paused", {
-      stoppedAt: "Paused from popup",
-      trigger
-    });
-    return { success: false, message: "Grade extraction is paused in popup controls." };
-  }
-
-  gradeExtractionState.inFlight = true;
-  const existingSession = await getGradeCombinedSession();
-  const runId = trigger === "auto-on-open" && existingSession?.runId
-    ? String(existingSession.runId)
-    : `grade-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-  gradeExtractionState.lastRunId = runId;
-
-  postGradeExtractionStatus("running", {
-    runId,
-    trigger,
-    extractedCount: 0,
-    startedAt: Date.now()
-  });
-
-  try {
-    const attempts = await extractGradeAttemptsFromPage(runId, trigger);
-
-    if (attempts && attempts.pending) {
-      return { success: true, pending: true, runId, extracted: Number(attempts.extractedCount || 0) };
-    }
-
-    const finalAttempts = Array.isArray(attempts)
-      ? attempts
-      : (Array.isArray(attempts?.completedAttempts) ? attempts.completedAttempts : []);
-    const completedStopReason = String(attempts?.stoppedAt || "").trim();
-
-    if (!finalAttempts.length) {
-      postGradeExtractionStatus("error", {
-        runId,
-        error: "No grade attempts were extracted from the page.",
-        stoppedAt: "No grade rows found"
-      });
-      return { success: false, message: "No grade attempts were extracted from the page." };
-    }
-
-    const deliveryResponse = await new Promise((resolve) => {
-      safeSendRuntimeMessage(
-        {
-          action: "gradeAttemptsExtracted",
-          data: {
-            runId,
-            attempts: finalAttempts,
-            summary: {
-              extracted: finalAttempts.length,
-              termsProcessed: Array.from(new Set(finalAttempts.map((item) => item.portalTermLabel))).length
-            },
-            extractedAt: Date.now()
-          }
-        },
-        (response) => resolve(response)
-      );
-    });
-
-    const deliveryOk = Boolean(deliveryResponse?.success);
-    if (!deliveryOk) {
-      const message = String(deliveryResponse?.message || "Failed to deliver extracted grades to web app localStorage.").trim();
-      postGradeExtractionStatus("error", {
-        runId,
-        extractedCount: finalAttempts.length,
-        error: message,
-        stoppedAt: "Delivery failed",
-        completedAt: Date.now()
-      });
-      return { success: false, message, runId };
-    }
-
-    postGradeExtractionStatus("completed", {
-      runId,
-      extractedCount: finalAttempts.length,
-      completedAt: Date.now(),
-      stoppedAt: completedStopReason || "Completed"
-    });
-
-    return { success: true, extracted: finalAttempts.length, runId };
-  } catch (error) {
-    const message = error?.message || String(error);
-    postGradeExtractionStatus("error", {
-      runId,
-      error: message,
-      stoppedAt: "Runtime error"
-    });
-    return { success: false, message };
-  } finally {
-    gradeExtractionState.inFlight = false;
-  }
-}
-
-async function maybeAutoRunGradeExtraction() {
-  if (!isTopWindow || !isGradesPage) return;
-  if (gradeExtractionState.autoRunTried) return;
-  gradeExtractionState.autoRunTried = true;
-
-  await sleep(1200);
-  const session = await getGradeCombinedSession();
-  if (session?.runId) {
-    await runGradeExtractionAutomation("auto-on-open");
-    return;
-  }
-
-  await runGradeExtractionAutomation("auto-on-open");
-}
-
-if (isGradesPage && isTopWindow) {
-  maybeAutoRunGradeExtraction();
-}
-
-if (hasUsableExtensionContext()) {
-  try {
-    chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
-      if (request.action === "startCourseExtraction") {
-        runOfferingsExtraction("background-trigger")
-          .then((result) => sendResponse(result))
-          .catch((error) => sendResponse({ success: false, message: error?.message || String(error) }));
-        return true;
-      }
-
-      if (request.action === "startGradeExtraction") {
-        runGradeExtractionAutomation("background-trigger")
-          .then((result) => sendResponse(result))
-          .catch((error) => sendResponse({ success: false, message: error?.message || String(error) }));
-        return true;
-      }
-      return false;
-    });
-  } catch {
-    // Extension context can be invalidated when extension reloads.
-  }
 }
