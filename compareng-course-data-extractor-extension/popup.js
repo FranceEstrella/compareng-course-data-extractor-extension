@@ -838,8 +838,21 @@ function runOSESRetry() {
 	});
 }
 
+function renderExtensionVersion() {
+	const versionEl = document.getElementById("extension-version");
+	if (!versionEl) return;
+
+	try {
+		const version = chrome?.runtime?.getManifest?.()?.version;
+		versionEl.textContent = version ? `Version ${version}` : "Version --";
+	} catch {
+		versionEl.textContent = "Version --";
+	}
+}
+
 document.addEventListener("DOMContentLoaded", () => {
 	installDynamicPopupResize();
+	renderExtensionVersion();
 	renderNewFeaturesGate();
 	renderOSESStatus();
 	renderOSESInfo();
