@@ -15,10 +15,12 @@
   padding: 0;
   font-family: 'Inter', sans-serif;
       background: linear-gradient(to bottom, #003366, #006699);
+  background-color: #003366;
   color: #fff;
-      width: 360px;
+      width: 100%;
+      min-width: 360px;
       height: auto;
-      overflow: hidden;
+      overflow-y: auto;
 }
 
 .container {
@@ -28,12 +30,47 @@
   box-shadow: none;
   text-align: center;
       width: 100%;
-    height: auto;
+  height: auto;
+  overflow: visible;
   box-sizing: border-box;
   border: none;
   display: flex;
   flex-direction: column;
   align-items: center;
+}
+
+html,
+body {
+  scrollbar-width: thin;
+  scrollbar-color: rgba(125, 211, 252, 0.85) rgba(0, 72, 122, 0.75);
+}
+
+html::-webkit-scrollbar,
+body::-webkit-scrollbar {
+  width: 12px;
+}
+
+html::-webkit-scrollbar-track,
+body::-webkit-scrollbar-track {
+  background: linear-gradient(180deg, rgba(0, 72, 122, 0.85), rgba(0, 102, 153, 0.8));
+  border-radius: 999px;
+}
+
+html::-webkit-scrollbar-thumb,
+body::-webkit-scrollbar-thumb {
+  background: linear-gradient(180deg, rgba(125, 211, 252, 0.9), rgba(56, 189, 248, 0.85));
+  border-radius: 999px;
+  border: 2px solid rgba(0, 72, 122, 0.65);
+}
+
+html::-webkit-scrollbar-thumb:hover,
+body::-webkit-scrollbar-thumb:hover {
+  background: linear-gradient(180deg, rgba(186, 230, 253, 0.95), rgba(125, 211, 252, 0.95));
+}
+
+html::-webkit-scrollbar-corner,
+body::-webkit-scrollbar-corner {
+  background: #003366;
 }
 
 #logo {
@@ -426,6 +463,8 @@ h1 {
   max-height: 120px;
   overflow-y: auto;
   background: rgba(2, 6, 23, 0.18);
+  scrollbar-width: thin;
+  scrollbar-color: rgba(125, 211, 252, 0.55) rgba(15, 23, 42, 0.35);
 }
 
 #grade-import-list {
@@ -436,6 +475,31 @@ h1 {
   max-height: 180px;
   overflow-y: auto;
   background: rgba(2, 6, 23, 0.18);
+  scrollbar-width: thin;
+  scrollbar-color: rgba(125, 211, 252, 0.55) rgba(15, 23, 42, 0.35);
+}
+
+#irregular-course-list::-webkit-scrollbar,
+#grade-import-list::-webkit-scrollbar {
+  width: 10px;
+}
+
+#irregular-course-list::-webkit-scrollbar-track,
+#grade-import-list::-webkit-scrollbar-track {
+  background: rgba(15, 23, 42, 0.35);
+  border-radius: 999px;
+}
+
+#irregular-course-list::-webkit-scrollbar-thumb,
+#grade-import-list::-webkit-scrollbar-thumb {
+  background: linear-gradient(180deg, rgba(125, 211, 252, 0.75), rgba(56, 189, 248, 0.75));
+  border-radius: 999px;
+  border: 2px solid rgba(15, 23, 42, 0.35);
+}
+
+#irregular-course-list::-webkit-scrollbar-thumb:hover,
+#grade-import-list::-webkit-scrollbar-thumb:hover {
+  background: linear-gradient(180deg, rgba(186, 230, 253, 0.92), rgba(125, 211, 252, 0.92));
 }
 
 .irregular-course-row {
@@ -637,14 +701,6 @@ h1 {
   height: 18px;
   object-fit: contain;
 }
-
-#turn-on-new-features {
-  padding: 2px;
-  min-height: 8px;
-  font-size: 0;
-  line-height: 0;
-  margin: 0;
-}
   </style>
 </head>
 <body>
@@ -736,9 +792,6 @@ h1 {
         <img src="images/default_icon.png" alt="Portal" class="button-icon" />
         Student Portal
       </a>
-      <button id="turn-on-new-features" class="button" type="button">
-        Turn On New Features
-      </button>
     </div>
   </div>
 

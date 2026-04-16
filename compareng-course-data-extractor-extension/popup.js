@@ -93,6 +93,8 @@ const SUCCESS_STAGES = new Set([
 	"irregular_completed"
 ]);
 
+const FORWARDED_BLOCK_SECTION_TTL_MS = 15 * 60 * 1000;
+
 function safeRuntimeSendMessage(payload, callback) {
 	try {
 		if (!chrome?.runtime?.id) return false;
@@ -122,61 +124,73 @@ function syncPopupHeightToContent() {
 	requestAnimationFrame(() => {
 		const docEl = document.documentElement;
 		const body = document.body;
+		const container = document.querySelector(".container");
 		if (!docEl || !body) return;
 
 		// Reset first, then apply exact content height so the popup shrinks when sections are hidden.
 		docEl.style.height = "auto";
 		body.style.height = "auto";
 
-		const contentHeight = Math.max(body.scrollHeight, docEl.scrollHeight);
+		const containerHeight = container ? container.scrollHeight : 0;
+		const contentHeight = Math.max(body.scrollHeight, docEl.scrollHeight, containerHeight);
 		docEl.style.height = `${contentHeight}px`;
 		body.style.height = `${contentHeight}px`;
 	});
 }
 
-function setNewFeaturesVisibility(enabled) {
+let popupResizeObserver = null;
+let popupResizeTicking = false;
+
+function queuePopupResizeSync() {
+	if (popupResizeTicking) return;
+	popupResizeTicking = true;
+	requestAnimationFrame(() => {
+		popupResizeTicking = false;
+		syncPopupHeightToContent();
+	});
+}
+
+function installDynamicPopupResize() {
+	if (popupResizeObserver) return;
+
+	const container = document.querySelector(".container");
+	const developerSettings = document.getElementById("developer-settings");
+	const targets = [document.documentElement, document.body, container, developerSettings].filter(Boolean);
+
+	if (typeof ResizeObserver === "function") {
+		popupResizeObserver = new ResizeObserver(() => {
+			queuePopupResizeSync();
+		});
+
+		targets.forEach((el) => popupResizeObserver.observe(el));
+	}
+
+	if (developerSettings) {
+		developerSettings.addEventListener("transitionend", queuePopupResizeSync);
+	}
+
+	window.addEventListener("resize", queuePopupResizeSync);
+	queuePopupResizeSync();
+}
+
+function setNewFeaturesVisibility() {
 	const osesStatusWrap = document.getElementById("oses-status-wrap");
 	const osesInfoWrap = document.getElementById("oses-info-wrap");
 	const irregularWrap = document.getElementById("irregular-wrap");
 	const gradeImportWrap = document.getElementById("grade-import-wrap");
 	const developerWrap = document.getElementById("developer-wrap");
-	const turnOnButton = document.getElementById("turn-on-new-features");
 
-	const hiddenDisplay = enabled ? "" : "none";
-	if (osesStatusWrap) osesStatusWrap.style.display = hiddenDisplay;
-	if (osesInfoWrap) osesInfoWrap.style.display = hiddenDisplay;
-	if (irregularWrap) irregularWrap.style.display = hiddenDisplay;
-	if (gradeImportWrap) gradeImportWrap.style.display = hiddenDisplay;
-	if (developerWrap) developerWrap.style.display = hiddenDisplay;
-
-	if (turnOnButton) {
-		turnOnButton.style.display = "";
-		turnOnButton.style.opacity = "0";
-		turnOnButton.style.pointerEvents = "auto";
-		turnOnButton.textContent = enabled ? "Turn Off New Features" : "Turn On New Features";
-	}
+	if (osesStatusWrap) osesStatusWrap.style.display = "";
+	if (osesInfoWrap) osesInfoWrap.style.display = "";
+	if (irregularWrap) irregularWrap.style.display = "";
+	if (gradeImportWrap) gradeImportWrap.style.display = "";
+	if (developerWrap) developerWrap.style.display = "";
 
 	syncPopupHeightToContent();
 }
 
 function renderNewFeaturesGate() {
-	chrome.storage.local.get(["osesNewFeaturesEnabled"], (result) => {
-		const enabled = result?.osesNewFeaturesEnabled === true;
-		setNewFeaturesVisibility(enabled);
-	});
-}
-
-function setNewFeaturesEnabled(enabled) {
-	chrome.storage.local.set({ osesNewFeaturesEnabled: enabled === true }, () => {
-		renderNewFeaturesGate();
-		renderOSESStatus();
-		renderOSESInfo();
-		renderIrregularStatus();
-		renderIrregularCourseList();
-		renderGradeExtractionStatus();
-		renderDeveloperMode();
-		renderAutomationControls();
-	});
+	setNewFeaturesVisibility();
 }
 
 function renderGradeExtractionStatus() {
@@ -288,7 +302,22 @@ function renderGradeExtractionStatus() {
 
 				const tLeft = document.createElement("span");
 				tLeft.className = "irregular-course-code";
-				tLeft.textContent = target?.url || "target";
+				// Always show a friendly status, never the direct URL
+				let displayText = "Data sent successfully";
+				if (typeof target?.url === "string") {
+					const url = target.url.toLowerCase();
+					if (url.includes("localhost") || url.includes("127.0.0.1") || url.includes("local")) {
+						displayText = "Data sent successfully to local app";
+					} else if (
+						url.includes("prod") ||
+						url.includes("live") ||
+						url.includes("production") ||
+						url.includes("vercel.app")
+					) {
+						displayText = "Data sent successfully to live app";
+					}
+				}
+				tLeft.textContent = displayText;
 
 				const tRight = document.createElement("span");
 				tRight.className = "irregular-course-status";
@@ -299,13 +328,6 @@ function renderGradeExtractionStatus() {
 				listEl.appendChild(row);
 			});
 		}
-	});
-}
-
-function toggleNewFeatures() {
-	chrome.storage.local.get(["osesNewFeaturesEnabled"], (result) => {
-		const enabled = result?.osesNewFeaturesEnabled === true;
-		setNewFeaturesEnabled(!enabled);
 	});
 }
 
@@ -357,7 +379,13 @@ function renderCourseUploadStatus() {
 	chrome.storage.local.get(["lastCourseUploadStatus"], (result) => {
 		const upload = result?.lastCourseUploadStatus || {};
 		const state = String(upload?.state || "idle").toLowerCase();
-		const message = String(upload?.message || "").trim();
+		let message = String(upload?.message || "").trim();
+
+		if (/^data sent successfully to\s+https?:\/\//i.test(message)) {
+			const lower = message.toLowerCase();
+			const isLocal = lower.includes("localhost") || lower.includes("127.0.0.1") || lower.includes("local");
+			message = isLocal ? "Data sent successfully to local app." : "Data sent successfully to live app.";
+		}
 
 		if (!message) {
 			statusEl.textContent = "Running in the background...";
@@ -528,6 +556,16 @@ function renderOSESInfo() {
 
 		const isRegular = regularRequest?.isRegular === true || String(regularRequest?.studentType || "").toLowerCase() === "regular";
 		const blockSection = String(regularRequest?.blockSection || "").trim().toUpperCase();
+		const updatedAt = Number(regularRequest?.updatedAt || 0);
+		const hasValidUpdatedAt = Number.isFinite(updatedAt) && updatedAt > 0;
+		const isExpired = hasValidUpdatedAt ? (Date.now() - updatedAt) > FORWARDED_BLOCK_SECTION_TTL_MS : Boolean(blockSection);
+
+		if (isRegular && blockSection && isExpired) {
+			forwardedSectionEl.textContent = "None";
+			chrome.storage.local.set({ osesBlockEnrollmentRequest: null });
+			return;
+		}
+
 		forwardedSectionEl.textContent = isRegular && blockSection ? blockSection : "None";
 	});
 }
@@ -699,6 +737,7 @@ function renderDeveloperMode() {
 		modeEl.style.color = isOn ? "#86efac" : "#fca5a5";
 		toggle.checked = isOn;
 		wrap.classList.toggle("collapsed", !isOn);
+		syncPopupHeightToContent();
 	});
 }
 
@@ -721,6 +760,7 @@ function setDeveloperModeEnabled(enabled) {
 		renderIrregularStatus();
 		renderGradeExtractionStatus();
 		renderOSESStatus();
+		syncPopupHeightToContent();
 	});
 }
 
@@ -799,6 +839,7 @@ function runOSESRetry() {
 }
 
 document.addEventListener("DOMContentLoaded", () => {
+	installDynamicPopupResize();
 	renderNewFeaturesGate();
 	renderOSESStatus();
 	renderOSESInfo();
@@ -807,11 +848,6 @@ document.addEventListener("DOMContentLoaded", () => {
 	renderGradeExtractionStatus();
 	renderDeveloperMode();
 	renderAutomationControls();
-
-	const turnOnNewFeaturesBtn = document.getElementById("turn-on-new-features");
-	if (turnOnNewFeaturesBtn) {
-		turnOnNewFeaturesBtn.addEventListener("click", toggleNewFeatures);
-	}
 
 	const retryButton = document.getElementById("oses-retry");
 	if (retryButton) {
@@ -902,9 +938,7 @@ chrome.storage.onChanged.addListener((changes, areaName) => {
 		renderOfferingsRefreshStatus();
 	}
 
-	if (changes.osesNewFeaturesEnabled) {
-		renderNewFeaturesGate();
-	}
 });
 
 setInterval(renderOfferingsRefreshStatus, 1000);
+setInterval(renderOSESInfo, 30000);

@@ -1052,16 +1052,20 @@ chrome.runtime.onMessage.addListener(function(request, sender, sendResponse) {
 
             const firstSuccess = normalized.find(item => item.ok);
             if (firstSuccess) {
+                const sentToLocal = /localhost|127\.0\.0\.1|local/i.test(String(firstSuccess.url || ""));
+                const successMessage = sentToLocal
+                    ? "Data sent successfully to local app."
+                    : "Data sent successfully to live app.";
                 chrome.storage.local.set({
                     lastCourseUploadStatus: {
                         state: "success",
-                        message: `Data sent successfully to ${firstSuccess.url}.`,
+                        message: successMessage,
                         targetMode: "dual",
                         targets: normalized,
                         updatedAt: Date.now()
                     }
                 });
-                sendResponse({ success: true, message: `Data sent successfully to ${firstSuccess.url}.`, targets: normalized });
+                sendResponse({ success: true, message: successMessage, targets: normalized });
                 return;
             }
 
