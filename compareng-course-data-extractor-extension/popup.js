@@ -457,6 +457,31 @@ function clearIrregularQueue() {
 	});
 }
 
+function clearAllStatus() {
+	chrome.storage.local.set({
+		osesAutomationStatus: null,
+		osesBlockEnrollmentRequest: null,
+		osesIrregularEnrollmentRequest: null,
+		osesIrregularProgress: null,
+		osesIrregularRetryMode: null,
+		osesPendingConfirmation: null,
+		osesGradeExtractionProgress: null,
+		lastFetchedCourseContext: null,
+		lastCourseUploadStatus: null,
+		osesOfferingsAutoRefreshStatus: null
+	}, () => {
+		renderOSESStatus();
+		renderOSESInfo();
+		renderIrregularStatus();
+		renderIrregularCourseList();
+		renderGradeExtractionStatus();
+		renderCourseUploadStatus();
+		renderOfferingsRefreshStatus();
+		renderFetchedStatus();
+		syncPopupHeightToContent();
+	});
+}
+
 document.addEventListener("DOMContentLoaded", renderFetchedStatus);
 document.addEventListener("DOMContentLoaded", renderCourseUploadStatus);
 document.addEventListener("DOMContentLoaded", renderOfferingsRefreshStatus);
@@ -900,6 +925,11 @@ document.addEventListener("DOMContentLoaded", () => {
 	const offeringsRefreshToggleBtn = document.getElementById("offerings-refresh-toggle");
 	if (offeringsRefreshToggleBtn) {
 		offeringsRefreshToggleBtn.addEventListener("click", toggleOfferingsAutoRefresh);
+	}
+
+	const clearStatusBtn = document.getElementById("developer-clear-status");
+	if (clearStatusBtn) {
+		clearStatusBtn.addEventListener("click", clearAllStatus);
 	}
 
 	const developerModeToggle = document.getElementById("developer-mode-toggle");

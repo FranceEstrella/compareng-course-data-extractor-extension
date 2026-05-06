@@ -54,6 +54,41 @@ function emitGradeAttemptsUpdate(detail) {
   }
 }
 
+function emitCourseOfferingsUpdate(detail) {
+  try {
+    window.dispatchEvent(new CustomEvent("compareng:courseOfferingsUpdated", { detail }));
+  } catch {
+    // Ignore event dispatch issues on locked-down pages.
+  }
+
+  try {
+    document.dispatchEvent(new CustomEvent("compareng:courseOfferingsUpdated", { detail }));
+  } catch {
+    // Ignore event dispatch issues on locked-down pages.
+  }
+
+  try {
+    window.postMessage(
+      {
+        source: "compareng-course-data-extractor-extension",
+        type: "courseOfferingsUpdated",
+        detail
+      },
+      "*"
+    );
+  } catch {
+    // Ignore postMessage issues.
+  }
+
+  try {
+    window.dispatchEvent(new StorageEvent("storage", { key: "comparengCourseOfferingsLatest" }));
+    window.dispatchEvent(new StorageEvent("storage", { key: "comparengCourseDataLatest" }));
+    window.dispatchEvent(new StorageEvent("storage", { key: "courseOfferingsPayload" }));
+  } catch {
+    // Some environments do not allow synthetic StorageEvent.
+  }
+}
+
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   if (request?.action !== "storeGradeAttemptsInLocalStorage") return false;
 
@@ -116,6 +151,72 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
         "comparengGradeAttemptsHistory",
         "gradeAttempts",
         "gradeAttemptsPayload"
+      ]
+    });
+    return false;
+  } catch (error) {
+    sendResponse({ success: false, message: error?.message || String(error) });
+    return false;
+  }
+});
+
+chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
+  if (request?.action !== "storeCourseOfferingsInLocalStorage") return false;
+
+  try {
+    const payload = request?.data || {};
+    const rows =
+      Array.isArray(payload?.rows)
+        ? payload.rows
+        : Array.isArray(payload?.data)
+          ? payload.data
+          : Array.isArray(payload?.courses)
+            ? payload.courses
+            : [];
+
+    if (!rows.length) {
+      sendResponse({ success: false, message: "Invalid course offerings payload." });
+      return false;
+    }
+
+    const term = String(payload?.term || rows[0]?.term || "").trim();
+    const schoolYear = String(payload?.schoolYear || rows[0]?.schoolYear || "").trim();
+    const extractedAt = Number(payload?.extractedAt || Date.now());
+
+    const latest = {
+      term,
+      schoolYear,
+      extractedAt,
+      updatedAt: Date.now(),
+      rows,
+      source: "compareng-course-data-extractor-extension"
+    };
+
+    const latestOk = safeWriteLocalStorageJson("comparengCourseOfferingsLatest", latest);
+    const legacyOk = safeWriteLocalStorageJson("comparengCourseDataLatest", latest);
+    const payloadOk = safeWriteLocalStorageJson("courseOfferingsPayload", latest);
+
+    if (!latestOk || !legacyOk || !payloadOk) {
+      sendResponse({ success: false, message: "Failed writing course offerings to localStorage." });
+      return false;
+    }
+
+    emitCourseOfferingsUpdate({
+      extractedAt,
+      extractedCount: rows.length,
+      term,
+      schoolYear
+    });
+
+    sendResponse({
+      success: true,
+      storedCount: rows.length,
+      term,
+      schoolYear,
+      storageKeys: [
+        "comparengCourseOfferingsLatest",
+        "comparengCourseDataLatest",
+        "courseOfferingsPayload"
       ]
     });
     return false;

@@ -1,5 +1,10 @@
 console.log("Background script loaded! [build 1.2.0-oses-login-m1]");
 
+const PORTAL_STATUS_TTL_MS = 60 * 60 * 1000;
+const PORTAL_STATUS_CLEANUP_ALARM = "osesPortalStatusExpiryCheck";
+const PORTAL_STATUS_CLEANUP_PERIOD_MIN = 10;
+const PORTAL_TAB_PATTERNS = ["https://solar.feutech.edu.ph/*", "https://*.feutech.edu.ph/*"];
+
 const COURSE_DATA_UPLOAD_TARGETS = {
     dual: {
         label: "Localhost + Production",
@@ -171,6 +176,76 @@ function ensureDeveloperDefaults() {
 }
 
 ensureDeveloperDefaults();
+
+function ensurePortalStatusCleanupAlarm() {
+    try {
+        if (!chrome?.alarms?.create) return;
+        chrome.alarms.create(PORTAL_STATUS_CLEANUP_ALARM, { periodInMinutes: PORTAL_STATUS_CLEANUP_PERIOD_MIN });
+    } catch {
+        // Ignore alarm creation failures.
+    }
+}
+
+ensurePortalStatusCleanupAlarm();
+
+chrome.runtime.onInstalled.addListener(() => {
+    ensurePortalStatusCleanupAlarm();
+});
+
+chrome.runtime.onStartup.addListener(() => {
+    ensurePortalStatusCleanupAlarm();
+});
+
+function isExpiredStatus(status, now) {
+    const updatedAt = Number(status?.updatedAt || 0);
+    if (!Number.isFinite(updatedAt) || updatedAt <= 0) return false;
+    return (now - updatedAt) >= PORTAL_STATUS_TTL_MS;
+}
+
+function queryPortalTabs() {
+    return new Promise((resolve) => {
+        try {
+            chrome.tabs.query({ url: PORTAL_TAB_PATTERNS }, (tabs) => {
+                resolve(Array.isArray(tabs) ? tabs : []);
+            });
+        } catch {
+            resolve([]);
+        }
+    });
+}
+
+async function expirePortalStatusesIfIdle() {
+    const tabs = await queryPortalTabs();
+    if (tabs.length > 0) return;
+
+    chrome.storage.local.get(["osesAutomationStatus", "lastFetchedCourseContext", "lastCourseUploadStatus"], (result) => {
+        const now = Date.now();
+        const patch = {};
+
+        if (isExpiredStatus(result?.osesAutomationStatus, now)) {
+            patch.osesAutomationStatus = null;
+        }
+
+        if (isExpiredStatus(result?.lastFetchedCourseContext, now)) {
+            patch.lastFetchedCourseContext = null;
+        }
+
+        if (isExpiredStatus(result?.lastCourseUploadStatus, now)) {
+            patch.lastCourseUploadStatus = null;
+        }
+
+        if (Object.keys(patch).length > 0) {
+            chrome.storage.local.set(patch);
+        }
+    });
+}
+
+if (chrome?.alarms?.onAlarm?.addListener) {
+    chrome.alarms.onAlarm.addListener((alarm) => {
+        if (alarm?.name !== PORTAL_STATUS_CLEANUP_ALARM) return;
+        expirePortalStatusesIfIdle();
+    });
+}
 
 function ensureAutomationModeConsistency() {
     chrome.storage.local.get([
@@ -550,6 +625,129 @@ async function writeGradeAttemptsToTabLocalStorage(tabId, payload) {
     });
 }
 
+async function writeCourseOfferingsToTabLocalStorage(tabId, payload) {
+    return new Promise((resolve) => {
+        try {
+            chrome.scripting.executeScript(
+                {
+                    target: { tabId },
+                    func: (injectedPayload) => {
+                        try {
+                            const safeWrite = (key, value) => {
+                                try {
+                                    localStorage.setItem(key, JSON.stringify(value));
+                                    return true;
+                                } catch {
+                                    return false;
+                                }
+                            };
+
+                            const sourcePayload = injectedPayload || {};
+                            const rows = Array.isArray(sourcePayload?.rows)
+                                ? sourcePayload.rows
+                                : Array.isArray(sourcePayload?.data)
+                                    ? sourcePayload.data
+                                    : Array.isArray(sourcePayload?.courses)
+                                        ? sourcePayload.courses
+                                        : [];
+
+                            if (!rows.length) {
+                                return { success: false, message: "Invalid payload in injected writer." };
+                            }
+
+                            const term = String(sourcePayload?.term || rows[0]?.term || "").trim();
+                            const schoolYear = String(sourcePayload?.schoolYear || rows[0]?.schoolYear || "").trim();
+                            const extractedAt = Number(sourcePayload?.extractedAt || Date.now());
+
+                            const latest = {
+                                term,
+                                schoolYear,
+                                extractedAt,
+                                updatedAt: Date.now(),
+                                rows,
+                                source: "compareng-course-data-extractor-extension"
+                            };
+
+                            const latestOk = safeWrite("comparengCourseOfferingsLatest", latest);
+                            const legacyOk = safeWrite("comparengCourseDataLatest", latest);
+                            const payloadOk = safeWrite("courseOfferingsPayload", latest);
+
+                            try {
+                                window.dispatchEvent(new CustomEvent("compareng:courseOfferingsUpdated", {
+                                    detail: { extractedAt, extractedCount: rows.length, term, schoolYear }
+                                }));
+                            } catch {
+                                // Ignore event dispatch issues.
+                            }
+
+                            try {
+                                document.dispatchEvent(new CustomEvent("compareng:courseOfferingsUpdated", {
+                                    detail: { extractedAt, extractedCount: rows.length, term, schoolYear }
+                                }));
+                            } catch {
+                                // Ignore event dispatch issues.
+                            }
+
+                            try {
+                                window.postMessage(
+                                    {
+                                        source: "compareng-course-data-extractor-extension",
+                                        type: "courseOfferingsUpdated",
+                                        detail: { extractedAt, extractedCount: rows.length, term, schoolYear }
+                                    },
+                                    "*"
+                                );
+                            } catch {
+                                // Ignore postMessage issues.
+                            }
+
+                            try {
+                                window.dispatchEvent(new StorageEvent("storage", { key: "comparengCourseOfferingsLatest" }));
+                                window.dispatchEvent(new StorageEvent("storage", { key: "comparengCourseDataLatest" }));
+                                window.dispatchEvent(new StorageEvent("storage", { key: "courseOfferingsPayload" }));
+                            } catch {
+                                // Some environments do not allow synthetic StorageEvent.
+                            }
+
+                            if (!latestOk || !legacyOk || !payloadOk) {
+                                return { success: false, message: "Failed writing localStorage in injected writer." };
+                            }
+
+                            return {
+                                success: true,
+                                storedCount: rows.length,
+                                term,
+                                schoolYear,
+                                storageKeys: [
+                                    "comparengCourseOfferingsLatest",
+                                    "comparengCourseDataLatest",
+                                    "courseOfferingsPayload"
+                                ]
+                            };
+                        } catch (error) {
+                            return { success: false, message: error?.message || String(error) };
+                        }
+                    },
+                    args: [payload]
+                },
+                (injectionResults) => {
+                    const runtimeError = chrome.runtime.lastError;
+                    if (runtimeError) {
+                        resolve({ success: false, message: runtimeError.message || "Script injection failed." });
+                        return;
+                    }
+
+                    const first = Array.isArray(injectionResults) ? injectionResults[0] : null;
+                    const result = first?.result || { success: false, message: "No script result returned." };
+                    resolve(result);
+                }
+            );
+        } catch (error) {
+            resolve({ success: false, message: error?.message || String(error) });
+        }
+    });
+}
+
 function normalizeGradeAttempts(rawAttempts) {
     const attempts = Array.isArray(rawAttempts) ? rawAttempts : [];
     const deduped = [];
@@ -627,6 +825,80 @@ async function postGradeAttemptsToTargets(payload) {
                 return { tab, response: fallback };
             } catch {
                 const fallback = await writeGradeAttemptsToTabLocalStorage(tab.id, payload);
+                return { tab, response: fallback };
+            }
+        })
+    );
+
+    return settled.map((result, index) => {
+        const tab = tabs[index];
+        const tabTarget = `${tab?.url || "tab"}#${tab?.id || "unknown"}`;
+
+        if (result.status === "fulfilled") {
+            return {
+                url: tabTarget,
+                ok: Boolean(result.value?.response?.success),
+                response: result.value?.response || null,
+                error: null
+            };
+        }
+
+        return {
+            url: tabTarget,
+            ok: false,
+            response: null,
+            error: result.reason?.message || String(result.reason || "Unknown error")
+        };
+    });
+}
+
+async function postCourseOfferingsToTargets(payload) {
+    const webAppPatterns = [
+        "http://localhost:3000/*",
+        "http://127.0.0.1/*",
+        "https://compareng-tools.vercel.app/*",
+        "https://compareng-coursetracker.vercel.app/*"
+    ];
+
+    const tabsById = new Map();
+    const tabCollections = await Promise.allSettled(
+        webAppPatterns.map((pattern) => queryTabsSafe({ url: pattern }))
+    );
+
+    tabCollections.forEach((result) => {
+        if (result.status !== "fulfilled") return;
+        result.value.forEach((tab) => {
+            if (typeof tab?.id !== "number") return;
+            tabsById.set(tab.id, tab);
+        });
+    });
+
+    const tabs = Array.from(tabsById.values());
+    if (!tabs.length) {
+        return [{
+            url: "webapp-tabs",
+            ok: false,
+            response: null,
+            error: "No ComParEng web app tab is open. Open the app first to receive course offerings in localStorage."
+        }];
+    }
+
+    const settled = await Promise.allSettled(
+        tabs.map(async (tab) => {
+            try {
+                const response = await sendTabMessageSafe(tab.id, {
+                    action: "storeCourseOfferingsInLocalStorage",
+                    data: payload
+                });
+
+                if (response?.success) {
+                    return { tab, response };
+                }
+
+                const fallback = await writeCourseOfferingsToTabLocalStorage(tab.id, payload);
+                return { tab, response: fallback };
+            } catch {
+                const fallback = await writeCourseOfferingsToTabLocalStorage(tab.id, payload);
                 return { tab, response: fallback };
             }
         })
@@ -986,105 +1258,66 @@ chrome.runtime.onMessage.addListener(function(request, sender, sendResponse) {
             return false;
         }
 
-        const targets = COURSE_DATA_UPLOAD_TARGETS.dual.urls.slice();
-
-        const localTarget = targets.find((url) => /localhost|127\.0\.0\.1/i.test(url)) || targets[0];
         const fetchedContext = {
             term: String(courseData[0]?.term || "").trim(),
             schoolYear: String(courseData[0]?.schoolYear || "").trim(),
             updatedAt: Date.now()
         };
 
+        const payload = {
+            rows: courseData,
+            term: fetchedContext.term,
+            schoolYear: fetchedContext.schoolYear,
+            extractedAt: Date.now()
+        };
+
         chrome.storage.local.set({
             lastFetchedCourseContext: fetchedContext,
             lastCourseUploadStatus: {
                 state: "posting",
-                message: `Uploading ${courseData.length} row(s)...`,
-                targetMode: "dual",
-                targets,
+                message: `Saving ${courseData.length} row(s) to local app storage...`,
+                targetMode: "local",
+                targets: [],
                 updatedAt: Date.now()
             }
         });
 
-        Promise.allSettled(targets.map((url) => postCourseDataWithLoopbackFallback(url, courseData)))
-        .then(results => {
-            const normalized = results.map((result, index) => {
-                const url = targets[index];
-                if (result.status === 'fulfilled') {
-                    const responseData = result.value?.data || null;
-                    const explicitSuccess = typeof responseData?.success === "boolean" ? responseData.success : true;
-                    return {
-                        url,
-                        ok: explicitSuccess,
-                        response: {
-                            ...responseData,
-                            effectiveUrl: result.value?.effectiveUrl || url,
-                            usedFallback: result.value?.usedFallback === true
-                        },
-                        error: null
-                    };
-                }
+        postCourseOfferingsToTargets(payload)
+        .then((targets) => {
+            const anySuccess = targets.some((item) => item.ok);
+            const errorMessage = targets.find((item) => item.error)?.error;
+            const message = anySuccess
+                ? `Saved ${courseData.length} row(s) to ComParEng Tools local storage.`
+                : (errorMessage || "Failed to save course offerings in the web app.");
 
-                return {
-                    url,
-                    ok: false,
-                    response: null,
-                    error: result.reason?.message || String(result.reason || 'Unknown error')
-                };
-            });
-
-            console.log("Data send results by target:", normalized);
-
-            const localResult = normalized.find(item => item.url === localTarget);
-            if (localResult?.ok) {
-                chrome.storage.local.set({
-                    lastCourseUploadStatus: {
-                        state: "success",
-                        message: "Data sent successfully.",
-                        targetMode: "dual",
-                        targets: normalized,
-                        updatedAt: Date.now()
-                    }
-                });
-                sendResponse({ success: true, message: "Data sent to local API successfully.", targets: normalized });
-                return;
-            }
-
-            const firstSuccess = normalized.find(item => item.ok);
-            if (firstSuccess) {
-                const sentToLocal = /localhost|127\.0\.0\.1|local/i.test(String(firstSuccess.url || ""));
-                const successMessage = sentToLocal
-                    ? "Data sent successfully to local app."
-                    : "Data sent successfully to live app.";
-                chrome.storage.local.set({
-                    lastCourseUploadStatus: {
-                        state: "success",
-                        message: successMessage,
-                        targetMode: "dual",
-                        targets: normalized,
-                        updatedAt: Date.now()
-                    }
-                });
-                sendResponse({ success: true, message: successMessage, targets: normalized });
-                return;
-            }
-
-            const localError = localResult?.error || localResult?.response?.error;
             chrome.storage.local.set({
                 lastCourseUploadStatus: {
-                    state: "error",
-                    message: localError || "Failed to send data to all targets.",
-                    targetMode: "dual",
-                    targets: normalized,
+                    state: anySuccess ? "success" : "error",
+                    message,
+                    targetMode: "local",
+                    targets,
                     updatedAt: Date.now()
                 }
             });
+
             sendResponse({
-                success: false,
-                message: localError || "Failed to send data to all targets.",
-                targets: normalized,
-                targetMode: "dual"
+                success: anySuccess,
+                message,
+                targets
             });
+        })
+        .catch((error) => {
+            const message = error?.message || String(error || "Failed to save course offerings in the web app.");
+            chrome.storage.local.set({
+                lastCourseUploadStatus: {
+                    state: "error",
+                    message,
+                    targetMode: "local",
+                    targets: [],
+                    updatedAt: Date.now()
+                }
+            });
+            sendResponse({ success: false, message });
         });
 
         return true; // Indicate asynchronous response

@@ -637,6 +637,11 @@ h1 {
   background: rgba(21, 128, 61, 0.28);
 }
 
+.control-toggle.danger {
+  border-color: rgba(248, 113, 113, 0.6);
+  background: rgba(153, 27, 27, 0.35);
+}
+
 #oses-retry {
   margin-top: 8px;
   width: 100%;
@@ -789,6 +794,10 @@ h1 {
           <div class="control-row">
             <span class="control-label">Offerings Auto-Refresh</span>
             <button id="offerings-refresh-toggle" class="control-toggle paused" type="button">Off</button>
+          </div>
+          <div class="control-row">
+            <span class="control-label">Clear All Status</span>
+            <button id="developer-clear-status" class="control-toggle danger" type="button">Clear</button>
           </div>
         </div>
       </div>

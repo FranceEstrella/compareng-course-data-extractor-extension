@@ -17,7 +17,9 @@
       "storage",
       "tabs",
       "scripting",
-      "notifications"
+      "notifications",
+      "notifications",
+      "alarms"
     ],
 
     "content_scripts": [
