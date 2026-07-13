@@ -173,6 +173,10 @@ async function isIrregularAutomationPaused() {
 
 async function areNewFeaturesEnabled() {
   const store = await readStorage(["osesNewFeaturesEnabled"]);
+  if (!Object.prototype.hasOwnProperty.call(store || {}, "osesNewFeaturesEnabled")) {
+    return true;
+  }
+
   return store?.osesNewFeaturesEnabled === true;
 }
 
