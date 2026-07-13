@@ -60,10 +60,41 @@ function hasUsableExtensionContext() {
 function safeSendRuntimeMessage(payload, callback) {
   if (!hasUsableExtensionContext()) return false;
   try {
+    const promise = chrome.runtime.sendMessage(payload);
+    if (promise && typeof promise.then === "function") {
+      promise
+        .then((response) => {
+          const err = chrome.runtime.lastError;
+          if (err) {
+            if (typeof callback === "function") {
+              callback({ success: false, message: err.message, runtimeError: true });
+            }
+            return;
+          }
+          if (typeof callback === "function") {
+            callback(response);
+          }
+        })
+        .catch((error) => {
+          const err = chrome.runtime.lastError;
+          if (typeof callback === "function") {
+            callback({
+              success: false,
+              message: err?.message || error?.message || String(error),
+              runtimeError: true
+            });
+          }
+        });
+      return true;
+    }
+  } catch {
+    // Fallback if Promise API throws synchronously
+  }
+
+  try {
     chrome.runtime.sendMessage(payload, (response) => {
       const runtimeError = chrome.runtime.lastError;
       if (runtimeError) {
-        // "No SW" can happen briefly while MV3 service worker spins up or reloads.
         if (typeof callback === "function") {
           callback({ success: false, message: runtimeError.message, runtimeError: true });
         }
@@ -2089,7 +2120,13 @@ function doesSelectionLookApplied(expectedTermLabel, expectedSchoolYear) {
 
 function getSelectableOptions(selectEl) {
   if (!selectEl) return [];
-  return Array.from(selectEl.options || []).filter((option) => String(option.value || "").trim());
+  return Array.from(selectEl.options || []).filter((option) => {
+    const val = String(option.value || "").trim();
+    if (!val || val === "--") return false;
+    const text = getTextContent(option).trim();
+    if (!text || text === "--" || /select|choose/i.test(text)) return false;
+    return true;
+  });
 }
 
 function getOptionByReversePosition(selectEl, reversePosition) {
@@ -2201,6 +2238,23 @@ function isGradesAccessBlockedByBalance() {
   );
 }
 
+class GracefulStopError extends Error {
+  constructor(message, stoppedAt) {
+    super(message);
+    this.name = "GracefulStopError";
+    this.stoppedAt = stoppedAt;
+  }
+}
+
+function isGradesViewingUnavailable() {
+  const pageText = getTextContent(document.body).toLowerCase();
+  if (!pageText) return false;
+  return (
+    pageText.includes("grades viewing temporarily unavailable") ||
+    pageText.includes("temporarily unavailable")
+  );
+}
+
 async function extractGradeAttemptsFromPage(runId, trigger = "manual") {
   const attempts = [];
   let chronology = 0;
@@ -2242,9 +2296,23 @@ async function extractGradeAttemptsFromPage(runId, trigger = "manual") {
     schoolYearHint = "",
     selection = { schoolYearSnapshot: null, termSnapshot: null, schoolYearReverseOffset: null, termReverseOffset: null }
   ) => {
-    const maxAttempts = 40;
+    const maxAttempts = 15;
 
     for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+      if (isGradesViewingUnavailable()) {
+        throw new GracefulStopError(
+          "Grades viewing temporarily unavailable",
+          "Grades viewing temporarily unavailable"
+        );
+      }
+
+      if (isGradesAccessBlockedByBalance()) {
+        throw new GracefulStopError(
+          "Grades currently inaccessible due to account balance",
+          "Latest term inaccessible due to account balance"
+        );
+      }
+
       const portalTermLabel = portalTermLabelHint || findTermValue() || "Unknown Term";
 
       postGradeExtractionStatus("running", {
@@ -2286,200 +2354,312 @@ async function extractGradeAttemptsFromPage(runId, trigger = "manual") {
       await sleep(900);
     }
 
-    throw new Error(`Timed out waiting for grades to load for ${portalTermLabelHint || "selected term"}.`);
+    postGradeExtractionStatus("running", {
+      currentTermLabel: portalTermLabelHint || "Unknown Term",
+      extractedCount: attempts.length,
+      message: `No grades found for ${portalTermLabelHint || "selected term"}. Moving to next selection...`
+    });
+    return 0;
   };
 
   const initialYearSelect = findGradesSchoolYearSelect();
   const initialTermSelect = findGradesTermSelect();
   const singleCombinedSelect = Boolean(initialTermSelect && isCombinedTermSchoolYearSelect(initialTermSelect));
 
-  if (singleCombinedSelect) {
-    const liveCombinedSelect = findGradesTermSelect();
-    const allOptions = sortOptionsBottomFirst(getSelectableOptions(liveCombinedSelect)).map(toOptionSnapshot);
-    if (!allOptions.length) {
-      throw new Error("No term-school-year options found in dropdown.");
-    }
-
-    const selectedOption = liveCombinedSelect?.options?.[liveCombinedSelect.selectedIndex] || null;
-    const selectedSnapshot = selectedOption ? toOptionSnapshot(selectedOption) : allOptions[0];
-    const selectedKey = makeOptionKey(selectedSnapshot);
-
-    let session = await getGradeCombinedSession();
-    const shouldStartFresh = trigger !== "auto-on-open" || !session || session?.runId !== runId;
-
-    if (shouldStartFresh) {
-      session = {
-        runId,
-        queue: allOptions,
-        processedKeys: [],
-        attempts: [],
-        updatedAt: Date.now()
-      };
-    }
-
-    const processedKeys = Array.isArray(session.processedKeys) ? session.processedKeys : [];
-    const sessionAttempts = Array.isArray(session.attempts) ? session.attempts : [];
-    const queue = Array.isArray(session.queue) ? session.queue : allOptions;
-
-    const parseCurrent = parseTermSchoolYearLabel(selectedSnapshot?.text || "");
-    const parsedRows = collectCurrentGridRows(
-      parseCurrent.term || selectedSnapshot?.text || findTermValue() || "Unknown Term",
-      parseCurrent.schoolYear || readSchoolYearFromPage()
-    );
-
-    if (!processedKeys.includes(selectedKey) && parsedRows.length > 0) {
-      parsedRows.forEach((entry, idx) => {
-        sessionAttempts.push({
-          ...entry,
-          chronologicalIndex: sessionAttempts.length + idx
-        });
-      });
-      processedKeys.push(selectedKey);
-    }
-
-    const remaining = queue.filter((item) => !processedKeys.includes(makeOptionKey(item)));
-    const blockedByBalance = isGradesAccessBlockedByBalance();
-    const shouldStopBecauseLatestIsBlocked = blockedByBalance && parsedRows.length === 0;
-
-    postGradeExtractionStatus("running", {
-      runId,
-      currentTermLabel: selectedSnapshot?.text || findTermValue() || "Unknown Term",
-      extractedCount: sessionAttempts.length,
-      stoppedAt: "",
-      message: shouldStopBecauseLatestIsBlocked
-        ? "Stopping at latest term: grades inaccessible due to account balance."
-        : (remaining.length ? `Processed current selection. Remaining: ${remaining.length}` : "All selections processed.")
-    });
-
-    if (shouldStopBecauseLatestIsBlocked) {
-      clearGradeCombinedSession();
-      return {
-        completedAttempts: sessionAttempts,
-        stoppedAt: "Latest term inaccessible due to account balance"
-      };
-    }
-
-    if (!remaining.length) {
-      clearGradeCombinedSession();
-      return sessionAttempts;
-    }
-
-    const nextSnapshot = remaining[0];
-    setGradeCombinedSession({
-      runId,
-      queue: queue,
-      processedKeys,
-      attempts: sessionAttempts,
-      updatedAt: Date.now()
-    });
-
-    await applyGradesFilters({
-      schoolYearSnapshot: null,
-      termSnapshot: nextSnapshot,
-      schoolYearReverseOffset: null,
-      termReverseOffset: null
-    });
-
-    return { pending: true, runId, extractedCount: sessionAttempts.length };
-  } else {
-
-  const initialYearCount = getSelectableOptions(initialYearSelect).length;
-
-  if (initialYearCount > 0) {
-    for (let yearOffset = 0; yearOffset < initialYearCount; yearOffset += 1) {
-      const liveYearSelect = findGradesSchoolYearSelect();
-      const liveYearOption = getOptionByReversePosition(liveYearSelect, yearOffset);
-      const yearSnapshot = liveYearOption ? toOptionSnapshot(liveYearOption) : null;
-
-      if (yearSnapshot) {
-        await applyGradesFilters({
-          schoolYearSnapshot: yearSnapshot,
-          termSnapshot: null,
-          schoolYearReverseOffset: yearOffset,
-          termReverseOffset: null
-        });
+  try {
+    if (singleCombinedSelect) {
+      const liveCombinedSelect = findGradesTermSelect();
+      const allOptions = sortOptionsBottomFirst(getSelectableOptions(liveCombinedSelect)).map(toOptionSnapshot);
+      if (!allOptions.length) {
+        throw new Error("No term-school-year options found in dropdown.");
       }
 
-      const termSelectForYear = findGradesTermSelect();
-      const termCountForYear = getSelectableOptions(termSelectForYear).length;
+      const isValidOption = (snapshot) => {
+        if (!snapshot) return false;
+        const val = String(snapshot.value || "").trim();
+        const text = String(snapshot.text || "").trim();
+        if (!val || val === "--") return false;
+        if (!text || text === "--" || /select|choose/i.test(text)) return false;
+        return true;
+      };
 
-      if (!termCountForYear) {
-        await waitUntilGradesAreReadable(
-          findTermValue() || "Unknown Term",
-          yearSnapshot?.text || readSchoolYearFromPage(),
-          {
-            schoolYearSnapshot: yearSnapshot,
-            termSnapshot: null,
-            schoolYearReverseOffset: yearOffset,
-            termReverseOffset: null
-          }
-        );
-        continue;
+      const selectedOption = liveCombinedSelect?.options?.[liveCombinedSelect.selectedIndex] || null;
+      let selectedSnapshot = selectedOption ? toOptionSnapshot(selectedOption) : null;
+      if (!isValidOption(selectedSnapshot)) {
+        selectedSnapshot = allOptions[0];
+      }
+      const selectedKey = makeOptionKey(selectedSnapshot);
+
+      let session = await getGradeCombinedSession();
+      const shouldStartFresh = trigger !== "auto-on-open" || !session || session?.runId !== runId;
+
+      if (shouldStartFresh) {
+        session = {
+          runId,
+          queue: allOptions,
+          processedKeys: [],
+          attempts: [],
+          retryCount: {},
+          updatedAt: Date.now()
+        };
       }
 
-      for (let termOffset = 0; termOffset < termCountForYear; termOffset += 1) {
-        const freshYearSelect = findGradesSchoolYearSelect();
-        const freshYearOption = getOptionByReversePosition(freshYearSelect, yearOffset);
-        const freshYearSnapshot = freshYearOption ? toOptionSnapshot(freshYearOption) : yearSnapshot;
+      const processedKeys = Array.isArray(session.processedKeys) ? session.processedKeys : [];
+      const sessionAttempts = Array.isArray(session.attempts) ? session.attempts : [];
+      const queue = Array.isArray(session.queue) ? session.queue : allOptions;
 
-        const freshTermSelect = findGradesTermSelect();
-        const freshTermOption = getOptionByReversePosition(freshTermSelect, termOffset);
-        const termSnapshot = freshTermOption ? toOptionSnapshot(freshTermOption) : null;
+      attempts.push(...sessionAttempts);
 
-        await applyGradesFilters({
-          schoolYearSnapshot: freshYearSnapshot,
-          termSnapshot,
-          schoolYearReverseOffset: yearOffset,
-          termReverseOffset: termOffset
-        });
+      const parseCurrent = parseTermSchoolYearLabel(selectedSnapshot?.text || "");
+      const currentTermLabel = parseCurrent.term || selectedSnapshot?.text || findTermValue() || "Unknown Term";
+      const currentSchoolYear = parseCurrent.schoolYear || readSchoolYearFromPage();
 
-        await waitUntilGradesAreReadable(
-          termSnapshot?.text || findTermValue() || "Unknown Term",
-          freshYearSnapshot?.text || readSchoolYearFromPage(),
-          {
-            schoolYearSnapshot: freshYearSnapshot,
-            termSnapshot,
-            schoolYearReverseOffset: yearOffset,
-            termReverseOffset: termOffset
-          }
+      if (isGradesViewingUnavailable()) {
+        throw new GracefulStopError(
+          "Grades viewing temporarily unavailable",
+          "Grades viewing temporarily unavailable"
         );
       }
-    }
-  } else {
-    const initialTermCount = getSelectableOptions(initialTermSelect).length;
 
-    if (!initialTermCount) {
-      await waitUntilGradesAreReadable(findTermValue() || "Unknown Term", readSchoolYearFromPage(), {
-        schoolYearSnapshot: null,
-        termSnapshot: null
-      });
-    } else {
-      for (let termOffset = 0; termOffset < initialTermCount; termOffset += 1) {
-        const freshTermSelect = findGradesTermSelect();
-        const freshTermOption = getOptionByReversePosition(freshTermSelect, termOffset);
-        const termSnapshot = freshTermOption ? toOptionSnapshot(freshTermOption) : null;
+      if (isGradesAccessBlockedByBalance()) {
+        throw new GracefulStopError(
+          "Grades currently inaccessible due to account balance",
+          "Latest term inaccessible due to account balance"
+        );
+      }
 
-        if (termSnapshot) {
-          await applyGradesFilters({
-            termSnapshot,
-            schoolYearReverseOffset: null,
-            termReverseOffset: termOffset
-          });
+      let parsedRows = [];
+      const maxWaitAttempts = 15;
+      for (let attempt = 1; attempt <= maxWaitAttempts; attempt += 1) {
+        if (isGradesViewingUnavailable()) {
+          throw new GracefulStopError(
+            "Grades viewing temporarily unavailable",
+            "Grades viewing temporarily unavailable"
+          );
         }
 
-        await waitUntilGradesAreReadable(
-          termSnapshot?.text || findTermValue() || "Unknown Term",
-          readSchoolYearFromPage(),
-          {
+        if (isGradesAccessBlockedByBalance()) {
+          throw new GracefulStopError(
+            "Grades currently inaccessible due to account balance",
+            "Latest term inaccessible due to account balance"
+          );
+        }
+
+        if (!doesSelectionLookApplied(selectedSnapshot?.text, currentSchoolYear)) {
+          await applyGradesFilters({
             schoolYearSnapshot: null,
-            termSnapshot,
+            termSnapshot: selectedSnapshot,
             schoolYearReverseOffset: null,
-            termReverseOffset: termOffset
+            termReverseOffset: null
+          });
+          await sleep(900);
+          continue;
+        }
+
+        parsedRows = collectCurrentGridRows(currentTermLabel, currentSchoolYear);
+        if (parsedRows.length > 0) {
+          break;
+        }
+        await sleep(900);
+      }
+
+      if (parsedRows.length > 0) {
+        parsedRows.forEach((entry, idx) => {
+          attempts.push({
+            ...entry,
+            chronologicalIndex: attempts.length
+          });
+        });
+        processedKeys.push(selectedKey);
+      }
+
+      const retryCount = session.retryCount || {};
+
+      if (parsedRows.length === 0) {
+        const currentRetries = retryCount[selectedKey] || 0;
+        if (currentRetries < 2) {
+          const updatedRetryCount = { ...retryCount };
+          updatedRetryCount[selectedKey] = currentRetries + 1;
+
+          setGradeCombinedSession({
+            runId,
+            queue: queue,
+            processedKeys,
+            attempts: attempts,
+            retryCount: updatedRetryCount,
+            updatedAt: Date.now()
+          });
+
+          postGradeExtractionStatus("running", {
+            runId,
+            currentTermLabel,
+            extractedCount: attempts.length,
+            message: `No grades found for ${currentTermLabel}. Retrying term (attempt ${currentRetries + 1}/2)...`
+          });
+
+          await applyGradesFilters({
+            schoolYearSnapshot: null,
+            termSnapshot: selectedSnapshot,
+            schoolYearReverseOffset: null,
+            termReverseOffset: null
+          });
+
+          return { pending: true, runId, extractedCount: attempts.length };
+        } else {
+          // Genuinely empty term or stuck term. Mark it as processed to skip it and continue.
+          processedKeys.push(selectedKey);
+        }
+      }
+
+      const remaining = queue.filter((item) => !processedKeys.includes(makeOptionKey(item)));
+
+      postGradeExtractionStatus("running", {
+        runId,
+        currentTermLabel: selectedSnapshot?.text || findTermValue() || "Unknown Term",
+        extractedCount: attempts.length,
+        stoppedAt: "",
+        message: remaining.length ? `Processed current selection. Remaining: ${remaining.length}` : "All selections processed."
+      });
+
+      if (!remaining.length) {
+        clearGradeCombinedSession();
+        return attempts;
+      }
+
+      const nextSnapshot = remaining[0];
+      setGradeCombinedSession({
+        runId,
+        queue: queue,
+        processedKeys,
+        attempts: attempts,
+        retryCount: retryCount,
+        updatedAt: Date.now()
+      });
+
+      await applyGradesFilters({
+        schoolYearSnapshot: null,
+        termSnapshot: nextSnapshot,
+        schoolYearReverseOffset: null,
+        termReverseOffset: null
+      });
+
+      return { pending: true, runId, extractedCount: attempts.length };
+    } else {
+      const initialYearCount = getSelectableOptions(initialYearSelect).length;
+
+      if (initialYearCount > 0) {
+        for (let yearOffset = 0; yearOffset < initialYearCount; yearOffset += 1) {
+          const liveYearSelect = findGradesSchoolYearSelect();
+          const liveYearOption = getOptionByReversePosition(liveYearSelect, yearOffset);
+          const yearSnapshot = liveYearOption ? toOptionSnapshot(liveYearOption) : null;
+
+          if (yearSnapshot) {
+            await applyGradesFilters({
+              schoolYearSnapshot: yearSnapshot,
+              termSnapshot: null,
+              schoolYearReverseOffset: yearOffset,
+              termReverseOffset: null
+            });
           }
-        );
+
+          const termSelectForYear = findGradesTermSelect();
+          const termCountForYear = getSelectableOptions(termSelectForYear).length;
+
+          if (!termCountForYear) {
+            await waitUntilGradesAreReadable(
+              findTermValue() || "Unknown Term",
+              yearSnapshot?.text || readSchoolYearFromPage(),
+              {
+                schoolYearSnapshot: yearSnapshot,
+                termSnapshot: null,
+                schoolYearReverseOffset: yearOffset,
+                termReverseOffset: null
+              }
+            );
+            continue;
+          }
+
+          for (let termOffset = 0; termOffset < termCountForYear; termOffset += 1) {
+            const freshYearSelect = findGradesSchoolYearSelect();
+            const freshYearOption = getOptionByReversePosition(freshYearSelect, yearOffset);
+            const freshYearSnapshot = freshYearOption ? toOptionSnapshot(freshYearOption) : yearSnapshot;
+
+            const freshTermSelect = findGradesTermSelect();
+            const freshTermOption = getOptionByReversePosition(freshTermSelect, termOffset);
+            const termSnapshot = freshTermOption ? toOptionSnapshot(freshTermOption) : null;
+
+            await applyGradesFilters({
+              schoolYearSnapshot: freshYearSnapshot,
+              termSnapshot,
+              schoolYearReverseOffset: yearOffset,
+              termReverseOffset: termOffset
+            });
+
+            await waitUntilGradesAreReadable(
+              termSnapshot?.text || findTermValue() || "Unknown Term",
+              freshYearSnapshot?.text || readSchoolYearFromPage(),
+              {
+                schoolYearSnapshot: freshYearSnapshot,
+                termSnapshot,
+                schoolYearReverseOffset: yearOffset,
+                termReverseOffset: termOffset
+              }
+            );
+          }
+        }
+      } else {
+        const initialTermCount = getSelectableOptions(initialTermSelect).length;
+
+        if (!initialTermCount) {
+          await waitUntilGradesAreReadable(findTermValue() || "Unknown Term", readSchoolYearFromPage(), {
+            schoolYearSnapshot: null,
+            termSnapshot: null
+          });
+        } else {
+          for (let termOffset = 0; termOffset < initialTermCount; termOffset += 1) {
+            const freshTermSelect = findGradesTermSelect();
+            const freshTermOption = getOptionByReversePosition(freshTermSelect, termOffset);
+            const termSnapshot = freshTermOption ? toOptionSnapshot(freshTermOption) : null;
+
+            if (termSnapshot) {
+              await applyGradesFilters({
+                termSnapshot,
+                schoolYearReverseOffset: null,
+                termReverseOffset: termOffset
+              });
+            }
+
+            await waitUntilGradesAreReadable(
+              termSnapshot?.text || findTermValue() || "Unknown Term",
+              readSchoolYearFromPage(),
+              {
+                schoolYearSnapshot: null,
+                termSnapshot,
+                schoolYearReverseOffset: null,
+                termReverseOffset: termOffset
+              }
+            );
+          }
+        }
       }
     }
-  }
+  } catch (error) {
+    if (error instanceof GracefulStopError) {
+      clearGradeCombinedSession();
+      const deduped = [];
+      const seen = new Set();
+      attempts.forEach((item) => {
+        const key = `${item.courseCode}__${item.schoolYear}__${item.portalTermLabel}__${item.finalGrade}`;
+        if (seen.has(key)) return;
+        seen.add(key);
+        deduped.push(item);
+      });
+      return {
+        completedAttempts: deduped,
+        stoppedAt: error.stoppedAt
+      };
+    }
+    throw error;
   }
 
   const deduped = [];
@@ -2495,7 +2675,7 @@ async function extractGradeAttemptsFromPage(runId, trigger = "manual") {
 }
 
 async function runGradeExtractionAutomation(trigger = "manual") {
-  if (!isTopWindow || !isGradesPage) return { success: false, message: "Not on Student Grades page." };
+  if (!isGradesPage) return { success: false, message: "Not on Student Grades page." };
   if (gradeExtractionState.inFlight) return { success: true, message: "Grade extraction already running." };
   if (!(await areNewFeaturesEnabled())) return { success: false, message: "New Features are disabled in extension popup." };
 
@@ -2595,7 +2775,7 @@ async function runGradeExtractionAutomation(trigger = "manual") {
 }
 
 async function maybeAutoRunGradeExtraction() {
-  if (!isTopWindow || !isGradesPage) return;
+  if (!isGradesPage) return;
   if (gradeExtractionState.autoRunTried) return;
   gradeExtractionState.autoRunTried = true;
 
@@ -2609,7 +2789,7 @@ async function maybeAutoRunGradeExtraction() {
   await runGradeExtractionAutomation("auto-on-open");
 }
 
-if (isGradesPage && isTopWindow) {
+if (isGradesPage) {
   maybeAutoRunGradeExtraction();
 }
 

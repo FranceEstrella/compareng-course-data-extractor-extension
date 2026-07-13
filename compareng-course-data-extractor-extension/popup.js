@@ -103,6 +103,38 @@ function safeRuntimeSendMessage(payload, callback) {
 	}
 
 	try {
+		const promise = chrome.runtime.sendMessage(payload);
+		if (promise && typeof promise.then === "function") {
+			promise
+				.then((response) => {
+					const err = chrome.runtime.lastError;
+					if (err) {
+						if (typeof callback === "function") {
+							callback({ success: false, message: err.message, runtimeError: true });
+						}
+						return;
+					}
+					if (typeof callback === "function") {
+						callback(response);
+					}
+				})
+				.catch((error) => {
+					const err = chrome.runtime.lastError;
+					if (typeof callback === "function") {
+						callback({
+							success: false,
+							message: err?.message || error?.message || String(error),
+							runtimeError: true
+						});
+					}
+				});
+			return true;
+		}
+	} catch {
+		// Fallback if Promise API throws synchronously
+	}
+
+	try {
 		chrome.runtime.sendMessage(payload, (response) => {
 			const runtimeError = chrome.runtime.lastError;
 			if (runtimeError) {
